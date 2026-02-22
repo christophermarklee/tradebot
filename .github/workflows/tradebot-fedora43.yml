@@ -1,0 +1,62 @@
+name: TradeBot Fedora 43 Continuous
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: tradebot-fedora43-continuous
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: [self-hosted, linux, fedora-43]
+    timeout-minutes: 360
+    env:
+      CHUNK_MINUTES: "340"
+      PYTHON_BIN: python3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write .env from secret
+        shell: bash
+        run: |
+          if [[ -z "${{ secrets.BOT_ENV }}" ]]; then
+            echo "Missing BOT_ENV repository secret" >&2
+            exit 1
+          fi
+          cat > .env << 'EOF'
+${{ secrets.BOT_ENV }}
+EOF
+
+      - name: Run bot chunk
+        shell: bash
+        run: |
+          chmod +x scripts/run_bot_action.sh
+          ./scripts/run_bot_action.sh
+
+      - name: Re-dispatch workflow
+        if: always()
+        shell: bash
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/tradebot-fedora43.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'

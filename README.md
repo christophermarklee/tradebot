@@ -102,6 +102,37 @@ uv run --python 3.13 python -c "import tensorflow as tf; print(tf.__version__); 
 python src/bot.py
 ```
 
+## Production session (12-hour run)
+
+Run a bounded production session with one command:
+
+```bash
+bash scripts/run_production_session.sh
+```
+
+Defaults:
+- `DURATION_HOURS=12`
+- `PREPARE_MODEL=true` (runs GPU warmup + model training before bot loop)
+- hard timeout with graceful kill window
+
+Useful overrides:
+
+```bash
+DURATION_HOURS=12 PREPARE_MODEL=true MODEL_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
+```
+
+After completion, the script writes:
+- `logs/<session>_bot.log` (raw session output)
+- `logs/<session>_summary.json` (event/action/error summary)
+- `logs/<session>.status` (bot exit code; `124` means timeout reached cleanly)
+- `logs/<session>.meta.json` (session metadata)
+
+You can re-run summary manually for any session log:
+
+```bash
+python scripts/review_bot_session.py --log logs/<session>_bot.log --exit-code 124
+```
+
 ## Config
 
 Configuration is managed in two places:

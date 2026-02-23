@@ -16,6 +16,18 @@ ROOT = SRC_DIR.parent
 BACKTEST_PATH = ROOT / "tests" / "backtest.py"
 DEFAULT_RUNTIME_PARAMS_PATH = SRC_DIR / "runtime_params.json"
 
+# Load environment defaults from env.json
+ENV_JSON_PATH = SRC_DIR / "env.json"
+ENV_DEFAULTS: Dict[str, str] = {}
+if ENV_JSON_PATH.exists():
+    with open(ENV_JSON_PATH, "r") as f:
+        ENV_DEFAULTS = json.load(f)
+
+
+def get_config_value(name: str, default: str = "") -> str:
+    """Get configuration value from environment, falling back to env.json defaults."""
+    return os.getenv(name, ENV_DEFAULTS.get(name, default))
+
 
 def run_backtest_with_env(overrides: Dict[str, str]) -> Optional[Dict[str, float]]:
     env = os.environ.copy()
@@ -160,8 +172,8 @@ def run_sweep(
 
 
 def main() -> None:
-    backtest_days = int(os.getenv("BACKTEST_DAYS", "3"))
-    sweep_quiet = os.getenv("SWEEP_QUIET", "true").strip().lower() in {
+    backtest_days = int(get_config_value("BACKTEST_DAYS", "3"))
+    sweep_quiet = get_config_value("SWEEP_QUIET", "true").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -171,7 +183,7 @@ def main() -> None:
 
     best = run_sweep(backtest_days=backtest_days, sweep_quiet=sweep_quiet)
 
-    print("\nBest config for .env:")
+    print("\nBest config for env.json:")
     print(f"RSI_MIN={best['RSI_MIN']}")
     print(f"RSI_MAX={best['RSI_MAX']}")
     print(f"MOMENTUM_LOOKBACK={best['MOMENTUM_LOOKBACK']}")

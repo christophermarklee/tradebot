@@ -20,6 +20,7 @@ jobs:
     env:
       CHUNK_MINUTES: "340"
       PYTHON_BIN: python3
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,15 +35,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write .env from secret
+      - name: Write .env from secrets
         shell: bash
         run: |
-          if [[ -z "${{ secrets.BOT_ENV }}" ]]; then
-            echo "Missing BOT_ENV repository secret" >&2
+          if [[ -z "${{ secrets.APCA_API_KEY_ID }}" ]] || [[ -z "${{ secrets.APCA_API_SECRET_KEY }}" ]]; then
+            echo "Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY repository secrets" >&2
             exit 1
           fi
           cat > .env << 'EOF'
-          ${{ secrets.BOT_ENV }}
+          APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}
           EOF
 
       - name: Run bot chunk
@@ -50,6 +52,18 @@ jobs:
         run: |
           chmod +x scripts/run_bot_action.sh
           ./scripts/run_bot_action.sh
+
+      - name: Upload logs and data artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: |
+            logs/
+            src/runtime_params.json
+            trade_log.csv
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Commit runtime_params.json
         shell: bash

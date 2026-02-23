@@ -15,8 +15,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from bot import (  # noqa: E402
+    AlpacaRest,
     Config,
     apply_runtime_params,
+    get_config_value,
     load_config,
     load_runtime_params,
     should_enter,
@@ -65,18 +67,30 @@ def fetch_recent_bars(cfg: Config, days: int) -> List[Dict[str, Any]]:
 
 def run_backtest() -> None:
     cfg = load_config()
-    days = int(os.getenv("BACKTEST_DAYS", "3"))
-    runtime_params_file = os.getenv("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
+    days = int(get_config_value("BACKTEST_DAYS", "3"))
+    runtime_params_file = get_config_value("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
     runtime_params = load_runtime_params(runtime_params_file)
     if runtime_params:
         apply_runtime_params(cfg, runtime_params)
+
+    # Fetch actual account cash to use in backtest simulation
+    try:
+        api = AlpacaRest(cfg)
+        account_info = api.get_account()
+        starting_cash = float(account_info.get("cash", 0.0))
+        if starting_cash == 0.0:
+            print("Warning: Account cash is $0. Using configured starting_balance_usd.")
+            starting_cash = cfg.starting_balance_usd
+    except Exception as e:
+        print(f"Warning: Could not fetch account cash ({e}). Using configured starting_balance_usd.")
+        starting_cash = cfg.starting_balance_usd
 
     bars = fetch_recent_bars(cfg, days)
     if not bars:
         print("No bars returned for requested period. Check symbol and API credentials.")
         return
 
-    cash = cfg.starting_balance_usd
+    cash = starting_cash
     qty = 0.0
     entry_price = 0.0
     entry_notional = 0.0
@@ -85,7 +99,7 @@ def run_backtest() -> None:
 
     closes: List[float] = []
     trades: List[Dict[str, Any]] = []
-    max_equity_seen = cfg.starting_balance_usd
+    max_equity_seen = starting_cash
     max_drawdown_usd = 0.0
     max_drawdown_pct = 0.0
 
@@ -159,8 +173,8 @@ def run_backtest() -> None:
             continue
 
         if should_enter(closes, cfg):
-            budget = min(cash, cfg.starting_balance_usd)
-            notional = budget * 0.98
+            # Use actual available cash (98% for safety margin)
+            notional = cash * 0.98
             if notional > 10:
                 buy_qty = notional / price
                 cash -= notional
@@ -231,7 +245,7 @@ def run_backtest() -> None:
     else:
         print("Runtime params applied: none (using .env defaults)")
     print(f"Bars: {len(bars)}")
-    print(f"Starting cash: ${cfg.starting_balance_usd:,.2f}")
+    print(f"Starting cash (from account): ${starting_cash:,.2f}")
     print(f"Ending equity: ${equity:,.2f}")
     print(f"Realized PnL: ${realized_pnl:,.2f}")
     print(f"Max drawdown (USD): ${max_drawdown_usd:,.2f}")

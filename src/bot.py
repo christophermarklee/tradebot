@@ -14,6 +14,18 @@ load_dotenv()
 
 SRC_DIR = Path(__file__).resolve().parent
 
+# Load environment defaults from env.json
+ENV_JSON_PATH = SRC_DIR / "env.json"
+ENV_DEFAULTS: Dict[str, str] = {}
+if ENV_JSON_PATH.exists():
+    with open(ENV_JSON_PATH, "r") as f:
+        ENV_DEFAULTS = json.load(f)
+
+
+def get_config_value(name: str, default: str = "") -> str:
+    """Get configuration value from environment, falling back to env.json defaults."""
+    return os.getenv(name, ENV_DEFAULTS.get(name, default))
+
 
 @dataclass
 class Config:
@@ -49,22 +61,22 @@ class Config:
 
 
 def get_env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
+    value = get_config_value(name)
+    if not value:
         return default
     return float(value)
 
 
 def get_env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
+    value = get_config_value(name)
+    if not value:
         return default
     return int(value)
 
 
 def get_env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
+    value = get_config_value(name)
+    if not value:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -77,22 +89,23 @@ def normalize_trade_base_url(url: str) -> str:
 
 
 def load_config() -> Config:
+    # API credentials must be in environment variables (not in env.json)
     api_key = os.getenv("APCA_API_KEY_ID", "")
     api_secret = os.getenv("APCA_API_SECRET_KEY", "")
     if not api_key or not api_secret:
         raise ValueError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in your environment.")
 
     trade_base_url = normalize_trade_base_url(
-        os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+        get_config_value("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
     )
 
     return Config(
         api_key=api_key,
         api_secret=api_secret,
         trade_base_url=trade_base_url,
-        data_base_url=os.getenv("APCA_DATA_BASE_URL", "https://data.alpaca.markets"),
-        trade_symbol=os.getenv("TRADE_SYMBOL", "BTCUSD"),
-        data_symbol=os.getenv("DATA_SYMBOL", "BTC/USD"),
+        data_base_url=get_config_value("APCA_DATA_BASE_URL", "https://data.alpaca.markets"),
+        trade_symbol=get_config_value("TRADE_SYMBOL", "BTCUSD"),
+        data_symbol=get_config_value("DATA_SYMBOL", "BTC/USD"),
         starting_balance_usd=get_env_float("STARTING_BALANCE_USD", 10000.0),
         target_profit_usd=get_env_float("TARGET_PROFIT_USD", 50.0),
         stop_loss_usd=get_env_float("STOP_LOSS_USD", -50.0),
@@ -109,13 +122,13 @@ def load_config() -> Config:
         momentum_lookback=get_env_int("MOMENTUM_LOOKBACK", 5),
         min_momentum_pct=get_env_float("MIN_MOMENTUM_PCT", 0.05),
         entry_buffer_pct=get_env_float("ENTRY_BUFFER_PCT", 0.001),
-        trade_log_file=os.getenv("TRADE_LOG_FILE", "trade_log.csv"),
+        trade_log_file=get_config_value("TRADE_LOG_FILE", "trade_log.csv"),
         log_pretty=get_env_bool("LOG_PRETTY", False),
         backtest_days=get_env_int("BACKTEST_DAYS", 3),
         sweep_quiet=get_env_bool("SWEEP_QUIET", True),
         auto_sweep=get_env_bool("AUTO_SWEEP", True),
         sweep_refresh_minutes=get_env_int("SWEEP_REFRESH_MINUTES", 240),
-        runtime_params_file=os.getenv(
+        runtime_params_file=get_config_value(
             "RUNTIME_PARAMS_FILE",
             str(SRC_DIR / "runtime_params.json"),
         ),
@@ -236,6 +249,12 @@ def rsi(values: List[float], window: int) -> Optional[float]:
 def build_entry_signal(closes: List[float], cfg: Config) -> dict:
     needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1)
     if len(closes) < needed:
+        emit(
+            "data_insufficient",
+            bars_received=len(closes),
+            bars_needed=needed,
+            message=f"Need {needed} bars, got {len(closes)}",
+        )
         return {
             "enter": False,
             "enough_data": False,
@@ -412,11 +431,22 @@ def run() -> None:
     cooldown_until: float = 0.0
     runtime_signature = ""
 
+    # Fetch actual account cash at startup
+    try:
+        account_info = api.get_account()
+        account_cash = float(account_info.get("cash", 0.0))
+        account_equity = float(account_info.get("equity", 0.0))
+    except Exception as e:
+        emit("error", message=f"Failed to fetch account info at startup: {e}")
+        account_cash = 0.0
+        account_equity = 0.0
+
     emit(
         "startup",
         symbol=cfg.trade_symbol,
         target_profit_usd=cfg.target_profit_usd,
-        starting_balance_usd=cfg.starting_balance_usd,
+        account_cash_usd=round(account_cash, 2),
+        account_equity_usd=round(account_equity, 2),
         stop_loss_usd=cfg.stop_loss_usd,
         take_profit_buffer_usd=cfg.take_profit_buffer_usd,
         max_hold_minutes=cfg.max_hold_minutes,
@@ -431,6 +461,28 @@ def run() -> None:
         sweep_refresh_minutes=cfg.sweep_refresh_minutes,
         runtime_params_file=cfg.runtime_params_file,
     )
+
+    # Warmup period: wait for sufficient historical data
+    warmup_needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1)
+    emit("warmup", message=f"Waiting for {warmup_needed} bars of data before trading...")
+    warmup_attempts = 0
+    max_warmup_attempts = 10
+    while warmup_attempts < max_warmup_attempts:
+        try:
+            closes = api.get_closes(cfg.bar_limit)
+            if len(closes) >= warmup_needed:
+                emit("warmup_complete", bars_available=len(closes), bars_needed=warmup_needed)
+                break
+            emit("warmup_progress", bars_available=len(closes), bars_needed=warmup_needed, attempt=warmup_attempts + 1)
+            warmup_attempts += 1
+            time.sleep(30)
+        except Exception as err:
+            emit("warmup_error", message=str(err), attempt=warmup_attempts + 1)
+            warmup_attempts += 1
+            time.sleep(30)
+    
+    if warmup_attempts >= max_warmup_attempts:
+        emit("warmup_failed", message="Failed to get sufficient data after warmup period")
 
     try:
         while True:
@@ -534,6 +586,11 @@ def run() -> None:
                         continue
 
                     closes = api.get_closes(cfg.bar_limit)
+                    if len(closes) == 0:
+                        emit("error", message="No bars received from API")
+                        time.sleep(cfg.poll_seconds)
+                        continue
+                    
                     last_price = closes[-1]
                     signal = build_entry_signal(closes, cfg)
                     enter_now = bool(signal["enter"])
@@ -554,8 +611,8 @@ def run() -> None:
                     if enter_now:
                         account = api.get_account()
                         cash = float(account.get("cash", 0.0))
-                        budget = min(cash, cfg.starting_balance_usd)
-                        order_notional = budget * 0.98
+                        # Use actual account cash (98% for safety margin)
+                        order_notional = cash * 0.98
 
                         if order_notional > 10:
                             api.submit_buy_notional(order_notional)

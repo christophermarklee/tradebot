@@ -142,6 +142,37 @@ def run_sweep(
     wall time from ~10 minutes to under a minute.
     """
     configs = build_grid()
+    max_configs = int(get_config_value("SWEEP_MAX_CONFIGS", "0") or "0")
+    if max_configs > 0:
+        configs = configs[:max_configs]
+
+    sweep_bars_file = ROOT / ".sweep_bars_cache.json"
+    shared_backtest_env: Dict[str, str] = {"BACKTEST_SKIP_ACCOUNT_FETCH": "true"}
+    use_shared_bars = get_config_value("SWEEP_USE_SHARED_BARS", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if use_shared_bars:
+        try:
+            try:
+                import bot as _bot_module
+            except ModuleNotFoundError:
+                from src import bot as _bot_module  # type: ignore[no-redef]
+
+            sweep_cfg = _bot_module.load_config()
+            sweep_api = _bot_module.AlpacaRest(sweep_cfg)
+            sweep_bars = sweep_api.get_historical_bars(backtest_days)
+            if not sweep_bars:
+                raise RuntimeError("No bars returned for shared sweep cache")
+            sweep_bars_file.write_text(json.dumps(sweep_bars), encoding="utf-8")
+            shared_backtest_env["BACKTEST_BARS_FILE"] = str(sweep_bars_file)
+        except Exception as exc:
+            if not sweep_quiet:
+                print(f"Shared bars cache unavailable; falling back to per-run fetch: {exc}")
+
     results: List[Dict[str, object]] = []
     total = len(configs)
     completed = 0
@@ -160,7 +191,7 @@ def run_sweep(
         future_to_cfg = {
             executor.submit(
                 run_backtest_with_env,
-                {**cfg, "BACKTEST_DAYS": str(backtest_days)},
+                {**cfg, "BACKTEST_DAYS": str(backtest_days), **shared_backtest_env},
             ): cfg
             for cfg in configs
         }
@@ -200,6 +231,9 @@ def run_sweep(
 
     runtime_path = Path(runtime_params_path)
     write_runtime_params(runtime_path, best, backtest_days)
+
+    if sweep_bars_file.exists():
+        sweep_bars_file.unlink(missing_ok=True)
 
     return best
 

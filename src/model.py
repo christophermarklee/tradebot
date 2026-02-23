@@ -19,7 +19,10 @@ Feature vector (FEATURE_WINDOW + 4 values):
 """
 from __future__ import annotations
 
+import argparse
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -36,10 +39,12 @@ FEATURE_WINDOW = 50
 _cached_model = None
 _cached_model_path: Optional[str] = None
 _cached_model_mtime: Optional[float] = None
+_gpu_configured = False
+_gpu_device_info: Optional[str] = None
 
 
 def configure_gpu() -> str:
-    """Configure TensorFlow GPU: memory growth, mixed precision, XLA JIT.
+    """Configure TensorFlow GPU: memory growth and optional perf flags.
 
     Returns a string describing the active device ('GPU:0 (mixed-precision)' or 'CPU').
     Silently no-ops if TensorFlow or cuDNN is unavailable.
@@ -53,19 +58,47 @@ def configure_gpu() -> str:
             tf.config.experimental.set_memory_growth(gpu, True)
 
         if gpus:
-            # Mixed precision: compute in float16 (fast on Tensor Cores),
-            # accumulate gradients and store weights in float32 for stability
-            from tensorflow.keras import mixed_precision  # type: ignore[attr-defined]
-            mixed_precision.set_global_policy("mixed_float16")
+            use_mixed_precision = os.getenv("MODEL_USE_MIXED_PRECISION", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+            use_xla = os.getenv("MODEL_USE_XLA", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
 
-            # XLA JIT : fuses kernel operations for additional GPU speedup
-            tf.config.optimizer.set_jit(True)
+            if use_mixed_precision:
+                from tensorflow.keras import mixed_precision  # type: ignore[attr-defined]
+                mixed_precision.set_global_policy("mixed_float16")
 
-            return f"GPU:0 (mixed-precision float16, XLA enabled, {len(gpus)} device(s))"
+            if use_xla:
+                tf.config.optimizer.set_jit(True)
+
+            perf_flags: List[str] = []
+            if use_mixed_precision:
+                perf_flags.append("mixed-precision")
+            if use_xla:
+                perf_flags.append("xla")
+            perf_suffix = f" ({', '.join(perf_flags)})" if perf_flags else ""
+            return f"GPU:0{perf_suffix}, {len(gpus)} device(s)"
 
         return "CPU (no GPU detected)"
     except Exception as exc:  # pragma: no cover
         return f"CPU (GPU config error: {exc})"
+
+
+def _configure_gpu_once() -> str:
+    global _gpu_configured, _gpu_device_info
+    if not _gpu_configured:
+        _gpu_device_info = configure_gpu()
+        _gpu_configured = True
+    return _gpu_device_info or "CPU"
 
 
 def extract_features(
@@ -180,10 +213,10 @@ def train_model(
     except ImportError as exc:
         raise ImportError(
             "tensorflow is required for model training. "
-            "Install it with: pip install tensorflow"
+            "On Linux with NVIDIA GPU, follow TensorFlow pip install guidance and run: uv sync"
         ) from exc
 
-    device_info = configure_gpu()
+    device_info = _configure_gpu_once()
 
     X, y = build_training_data(
         bars, target_pct, max_horizon, short_window, long_window, rsi_window, momentum_lookback
@@ -312,6 +345,8 @@ def predict_entry(
     except ImportError:
         return None
 
+    _configure_gpu_once()
+
     feats = extract_features(closes, short_window, long_window, rsi_window, momentum_lookback)
     if feats is None:
         return None
@@ -333,3 +368,84 @@ def predict_entry(
         return float(_cached_model.predict(feats.reshape(1, -1), verbose=0)[0][0])
     except Exception:
         return None
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train and save the entry model to src/model.keras")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Number of historical days to fetch for training (defaults to MODEL_TRAIN_DAYS from config)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress detailed training logs",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU-only training run (disables visible CUDA devices)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    if args.cpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    try:
+        try:
+            import bot as _bot
+        except ModuleNotFoundError as exc:
+            if exc.name != "bot":
+                raise
+            from src import bot as _bot  # type: ignore[no-redef]
+
+        cfg = _bot.load_config()
+        train_days = int(args.days if args.days is not None else cfg.model_train_days)
+
+        api = _bot.AlpacaRest(cfg)
+        bars = api.get_historical_bars(train_days)
+        if not bars:
+            raise RuntimeError(
+                "No historical bars returned from Alpaca. Check API credentials, symbol, and data base URL."
+            )
+
+        metrics = train_model(
+            bars=bars,
+            short_window=cfg.short_window,
+            long_window=cfg.long_window,
+            rsi_window=cfg.rsi_window,
+            momentum_lookback=cfg.momentum_lookback,
+            quiet=args.quiet,
+        )
+        print(f"Model saved: {MODEL_PATH}")
+        print(f"Metrics: {metrics}")
+    except Exception as exc:
+        if "CUDA_ERROR_INVALID_HANDLE" in str(exc) and not args.cpu:
+            retry_cmd = [sys.executable, str(Path(__file__).resolve())]
+            if args.days is not None:
+                retry_cmd.extend(["--days", str(args.days)])
+            if args.quiet:
+                retry_cmd.append("--quiet")
+            retry_cmd.append("--cpu")
+
+            retry_env = os.environ.copy()
+            retry_env["CUDA_VISIBLE_DEVICES"] = "-1"
+            print(
+                "Model training failed on GPU with CUDA_ERROR_INVALID_HANDLE; retrying on CPU.",
+                file=sys.stderr,
+            )
+            retry = subprocess.run(retry_cmd, env=retry_env, check=False)
+            raise SystemExit(retry.returncode)
+
+        print(f"Model training failed: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+if __name__ == "__main__":
+    main()

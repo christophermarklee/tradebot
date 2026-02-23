@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -100,24 +101,54 @@ def analyze_bar_quality(bars: List[Dict[str, Any]]) -> Dict[str, float]:
 def run_backtest() -> None:
     cfg = load_config()
     days = int(get_config_value("BACKTEST_DAYS", "3"))
+    bars_file = get_config_value("BACKTEST_BARS_FILE", "").strip()
+    backtest_use_model = get_config_value("BACKTEST_USE_MODEL", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    backtest_skip_account_fetch = get_config_value("BACKTEST_SKIP_ACCOUNT_FETCH", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
     runtime_params_file = get_config_value("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
     runtime_params = load_runtime_params(runtime_params_file)
     if runtime_params:
         apply_runtime_params(cfg, runtime_params)
 
-    # Fetch actual account cash to use in backtest simulation
-    try:
-        api = AlpacaRest(cfg)
-        account_info = api.get_account()
-        starting_cash = float(account_info.get("cash", 0.0))
-        if starting_cash == 0.0:
-            print("Warning: Account cash is $0. Using configured starting_balance_usd.")
-            starting_cash = cfg.starting_balance_usd
-    except Exception as e:
-        print(f"Warning: Could not fetch account cash ({e}). Using configured starting_balance_usd.")
-        starting_cash = cfg.starting_balance_usd
+    api = AlpacaRest(cfg)
 
-    bars = fetch_recent_bars(cfg, days)
+    # Fetch actual account cash to use in backtest simulation
+    if backtest_skip_account_fetch:
+        starting_cash = cfg.starting_balance_usd
+    else:
+        try:
+            account_info = api.get_account()
+            starting_cash = float(account_info.get("cash", 0.0))
+            if starting_cash == 0.0:
+                print("Warning: Account cash is $0. Using configured starting_balance_usd.")
+                starting_cash = cfg.starting_balance_usd
+        except Exception as e:
+            print(f"Warning: Could not fetch account cash ({e}). Using configured starting_balance_usd.")
+            starting_cash = cfg.starting_balance_usd
+
+    bars: List[Dict[str, Any]]
+    if bars_file:
+        bars_path = Path(bars_file)
+        if not bars_path.exists():
+            raise FileNotFoundError(f"BACKTEST_BARS_FILE not found: {bars_path}")
+        payload = json.loads(bars_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("BACKTEST_BARS_FILE must contain a JSON array of bar objects")
+        bars = payload
+    else:
+        bars = fetch_recent_bars(cfg, days)
+
     if not bars:
         print("No bars returned for requested period. Check symbol and API credentials.")
         return
@@ -213,7 +244,7 @@ def run_backtest() -> None:
                 max_drawdown_pct = drawdown_pct
             continue
 
-        if should_enter(closes, cfg):
+        if should_enter(closes, cfg, use_model=backtest_use_model, emit_events=False):
             # Use actual available cash (98% for safety margin)
             notional = cash * 0.98
             if notional > 10:

@@ -1,0 +1,13 @@
+[project]
+name = "tradebot"
+version = "0.1.0"
+description = "Extremely simple Alpaca crypto trading bot"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "requests>=2.32.0",
+  "python-dotenv>=1.0.1",
+  "tensorflow[and-cuda]>=2.20.0; platform_system == 'Linux'",
+  "tensorflow>=2.20.0; platform_system != 'Linux'",
+  "numpy>=1.26.0",
+]

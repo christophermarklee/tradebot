@@ -18,12 +18,52 @@ The bot automatically uses your actual Alpaca account cash balance (98% for safe
 
 ## 1) Setup
 
-1. Create a Python virtual environment and activate it.
-2. Install dependencies:
+1. Install `uv` if needed:
    ```bash
-   pip install -r requirements.txt
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
-3. Copy `.env.example` to `.env` and add your Alpaca API credentials:
+2. Create a Python virtual environment and activate it:
+   ```bash
+   uv venv
+   source .venv/bin/activate
+   ```
+3. Install dependencies:
+   ```bash
+   uv sync
+   ```
+   This project is pinned to Python 3.13 and includes TensorFlow in the main environment.
+
+### Linux CUDA / GPU checklist (TensorFlow pip)
+
+For GPU acceleration, verify NVIDIA driver visibility first:
+
+```bash
+nvidia-smi
+```
+
+Then verify TensorFlow sees your GPU:
+
+```bash
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+If no GPU is listed, follow TensorFlow's Linux pip guidance to ensure CUDA components are correctly available in the environment.
+
+Then train and save the model file used by bot inference:
+
+```bash
+python src/model.py
+```
+
+This writes `src/model.keras`.
+
+When running `src/bot.py`, the bot can also retrain this model periodically using:
+- `AUTO_MODEL_RETRAIN=true`
+- `MODEL_REFRESH_MINUTES=240`
+- `MODEL_TRAIN_PYTHON=.venv/bin/python`
+
+If `src/model.keras` is missing or older than `MODEL_REFRESH_MINUTES`, bot auto-triggers retraining.
+4. Copy `.env.example` to `.env` and add your Alpaca API credentials:
    ```
    APCA_API_KEY_ID=your_key_here
    APCA_API_SECRET_KEY=your_secret_here
@@ -81,6 +121,7 @@ python tests/backtest.py
 It force-closes any open position on the last bar so results are fully realized.
 Set `BACKTEST_DAYS` in `.env` to change the window.
 Backtest now aborts early on stale/frozen data runs to avoid tuning on bad inputs.
+By default, backtest uses rule-based signals only for speed (`BACKTEST_USE_MODEL=false`). Set `BACKTEST_USE_MODEL=true` to include model inference.
 
 ## Diagnose feed vs market data
 

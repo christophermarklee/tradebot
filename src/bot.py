@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ class Config:
     runtime_params_file: str
     model_confidence_threshold: float
     model_train_days: int
+    auto_model_retrain: bool
+    model_refresh_minutes: int
+    model_train_python: str
     max_stale_polls: int
     max_bar_age_seconds: int
     stale_event_reset_after: int
@@ -139,6 +143,9 @@ def load_config() -> Config:
         ),
         model_confidence_threshold=get_env_float("MODEL_CONFIDENCE_THRESHOLD", 0.55),
         model_train_days=get_env_int("MODEL_TRAIN_DAYS", 30),
+        auto_model_retrain=get_env_bool("AUTO_MODEL_RETRAIN", True),
+        model_refresh_minutes=get_env_int("MODEL_REFRESH_MINUTES", 240),
+        model_train_python=get_config_value("MODEL_TRAIN_PYTHON", ".venv/bin/python"),
         max_stale_polls=get_env_int("MAX_STALE_POLLS", 4),
         max_bar_age_seconds=get_env_int("MAX_BAR_AGE_SECONDS", 180),
         stale_event_reset_after=get_env_int("STALE_EVENT_RESET_AFTER", 3),
@@ -289,15 +296,16 @@ def rsi(values: List[float], window: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def build_entry_signal(closes: List[float], cfg: Config) -> dict:
+def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True, emit_events: bool = True) -> dict:
     needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1)
     if len(closes) < needed:
-        emit(
-            "data_insufficient",
-            bars_received=len(closes),
-            bars_needed=needed,
-            message=f"Need {needed} bars, got {len(closes)}",
-        )
+        if emit_events:
+            emit(
+                "data_insufficient",
+                bars_received=len(closes),
+                bars_needed=needed,
+                message=f"Need {needed} bars, got {len(closes)}",
+            )
         return {
             "enter": False,
             "enough_data": False,
@@ -329,20 +337,21 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
 
     # Try model prediction — returns None when model is unavailable (graceful fallback)
     model_prob: Optional[float] = None
-    try:
+    if use_model:
         try:
-            import model as _model_module
-        except ModuleNotFoundError:
-            from src import model as _model_module  # type: ignore[no-redef]
-        model_prob = _model_module.predict_entry(
-            closes,
-            short_window=cfg.short_window,
-            long_window=cfg.long_window,
-            rsi_window=cfg.rsi_window,
-            momentum_lookback=cfg.momentum_lookback,
-        )
-    except Exception:
-        model_prob = None
+            try:
+                import model as _model_module
+            except ModuleNotFoundError:
+                from src import model as _model_module  # type: ignore[no-redef]
+            model_prob = _model_module.predict_entry(
+                closes,
+                short_window=cfg.short_window,
+                long_window=cfg.long_window,
+                rsi_window=cfg.rsi_window,
+                momentum_lookback=cfg.momentum_lookback,
+            )
+        except Exception:
+            model_prob = None
 
     enter = (
         model_prob >= cfg.model_confidence_threshold
@@ -365,8 +374,8 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
     }
 
 
-def should_enter(closes: List[float], cfg: Config) -> bool:
-    return bool(build_entry_signal(closes, cfg)["enter"])
+def should_enter(closes: List[float], cfg: Config, use_model: bool = True, emit_events: bool = True) -> bool:
+    return bool(build_entry_signal(closes, cfg, use_model=use_model, emit_events=emit_events)["enter"])
 
 
 def append_trade_log(
@@ -451,35 +460,72 @@ def apply_runtime_params(cfg: Config, params: Dict[str, Any]) -> None:
                 continue
 
 
-def _maybe_retrain_model(cfg: Config, api: "AlpacaRest") -> None:
-    """Fetch historical bars and retrain the TF entry signal model."""
+def _maybe_retrain_model(cfg: Config) -> None:
+    """Retrain TF entry model via dedicated ML Python interpreter."""
     try:
-        try:
-            import model as _model_module
-        except ModuleNotFoundError:
-            from src import model as _model_module  # type: ignore[no-redef]
-        emit("model_train_start", days=cfg.model_train_days)
-        bars = api.get_historical_bars(cfg.model_train_days)
-        if len(bars) < 200:
-            emit("model_train_skip", reason="insufficient_data", bars=len(bars))
+        train_python = cfg.model_train_python.strip()
+        if not train_python:
+            emit("model_train_skip", reason="empty_model_train_python")
             return
-        target_pct = (cfg.target_profit_usd / max(cfg.starting_balance_usd, 1.0)) * 100.0
-        metrics = _model_module.train_model(
-            bars=bars,
-            target_pct=target_pct,
-            max_horizon=cfg.max_hold_minutes,
-            short_window=cfg.short_window,
-            long_window=cfg.long_window,
-            rsi_window=cfg.rsi_window,
-            momentum_lookback=cfg.momentum_lookback,
-            quiet=cfg.sweep_quiet,
+
+        train_python_path = Path(train_python)
+        if train_python_path.is_absolute():
+            python_cmd = train_python_path
+        else:
+            python_cmd = SRC_DIR.parent / train_python_path
+
+        if not python_cmd.exists():
+            emit(
+                "model_train_skip",
+                reason="model_train_python_not_found",
+                model_train_python=str(python_cmd),
+            )
+            return
+
+        command = [str(python_cmd), str(SRC_DIR / "model.py"), "--days", str(cfg.model_train_days)]
+        if cfg.sweep_quiet:
+            command.append("--quiet")
+
+        emit(
+            "model_train_start",
+            days=cfg.model_train_days,
+            model_train_python=str(python_cmd),
         )
-        emit("model_train_complete", **metrics)
+
+        result = subprocess.run(
+            command,
+            cwd=str(SRC_DIR.parent),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            if not message:
+                message = f"trainer exited with code {result.returncode}"
+            emit("error", message=f"Model training failed: {message}")
+            return
+
+        model_path = SRC_DIR / "model.keras"
+        emit(
+            "model_train_complete",
+            model_path=str(model_path),
+            model_exists=model_path.exists(),
+            model_mtime_utc=(
+                datetime.fromtimestamp(model_path.stat().st_mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+                if model_path.exists()
+                else None
+            ),
+        )
     except Exception as err:
         emit("error", message=f"Model training failed: {err}")
 
 
-def maybe_refresh_runtime_params(cfg: Config, now_ts: float, api: Optional["AlpacaRest"] = None) -> None:
+def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
     if not cfg.auto_sweep:
         return
 
@@ -514,10 +560,29 @@ def maybe_refresh_runtime_params(cfg: Config, now_ts: float, api: Optional["Alpa
             equity=round(float(best["equity"]), 2),
             pnl=round(float(best["pnl"]), 2),
         )
-        if api is not None:
-            _maybe_retrain_model(cfg, api)
     except Exception as err:
         emit("error", message=f"Auto sweep failed: {err}")
+
+
+def maybe_refresh_model(cfg: Config, now_ts: float) -> None:
+    if not cfg.auto_model_retrain:
+        return
+
+    model_path = SRC_DIR / "model.keras"
+    refresh_seconds = max(cfg.model_refresh_minutes, 1) * 60
+    if model_path.exists():
+        age_seconds = now_ts - model_path.stat().st_mtime
+        if age_seconds < refresh_seconds:
+            return
+
+    emit(
+        "decision",
+        action="auto_model_retrain_start",
+        model_path=str(model_path),
+        model_refresh_minutes=cfg.model_refresh_minutes,
+        model_train_days=cfg.model_train_days,
+    )
+    _maybe_retrain_model(cfg)
 
 
 def run() -> None:
@@ -565,6 +630,9 @@ def run() -> None:
         auto_sweep=cfg.auto_sweep,
         sweep_refresh_minutes=cfg.sweep_refresh_minutes,
         runtime_params_file=cfg.runtime_params_file,
+        auto_model_retrain=cfg.auto_model_retrain,
+        model_refresh_minutes=cfg.model_refresh_minutes,
+        model_train_python=cfg.model_train_python,
     )
 
     # Warmup period: wait for sufficient historical data
@@ -593,7 +661,8 @@ def run() -> None:
         while True:
             try:
                 now_ts = time.time()
-                maybe_refresh_runtime_params(cfg, now_ts, api=api)
+                maybe_refresh_runtime_params(cfg, now_ts)
+                maybe_refresh_model(cfg, now_ts)
 
                 runtime_params = load_runtime_params(cfg.runtime_params_file)
                 if runtime_params:
@@ -807,13 +876,24 @@ def run() -> None:
 
             time.sleep(cfg.poll_seconds)
     except KeyboardInterrupt:
-        emit("shutdown", action="keyboard_interrupt_close_position")
+        try:
+            emit("shutdown", action="keyboard_interrupt_close_position")
+        except KeyboardInterrupt:
+            pass
         try:
             close_open_position(api)
             in_flight_side = None
+        except KeyboardInterrupt:
+            pass
         except Exception as err:
-            emit("error", message=f"Failed to close position on shutdown: {err}")
-        emit("shutdown", action="exit_clean")
+            try:
+                emit("error", message=f"Failed to close position on shutdown: {err}")
+            except KeyboardInterrupt:
+                pass
+        try:
+            emit("shutdown", action="exit_clean")
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

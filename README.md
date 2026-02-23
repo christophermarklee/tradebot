@@ -12,6 +12,7 @@ The bot automatically uses your actual Alpaca account cash balance (98% for safe
 - Computes short SMA (9) and long SMA (26)
 - Uses RSI and short-term momentum as additional entry filters
 - Buys when trend + RSI + momentum all agree
+- Detects stale/frozen market data and pauses entries until feed resumes
 - Exits on take-profit, stop-loss, or max hold time
 - Then waits for the next setup
 
@@ -49,6 +50,10 @@ All bot behavior settings are stored here. You can edit this file to change defa
 - `BAR_LIMIT`: Number of historical bars to fetch
 - `RSI_WINDOW`, `RSI_MIN`, `RSI_MAX`: RSI indicator settings
 - `MOMENTUM_LOOKBACK`, `MIN_MOMENTUM_PCT`: Momentum filter settings
+- `MAX_STALE_POLLS`: Number of consecutive stale polls before entry is paused
+- `MAX_BAR_AGE_SECONDS`: Max allowed age for latest bar before feed is treated as stale
+- `STALE_EVENT_RESET_AFTER`: Number of stale-data events before bot recreates Alpaca client automatically
+- `BACKTEST_MAX_STALE_RUN`: Abort backtest if too many consecutive identical closes are seen
 - And more...
 
 **Note:** The bot automatically uses your actual Alpaca account cash balance. It will invest 98% of available cash per trade for safety.
@@ -75,6 +80,17 @@ python tests/backtest.py
 
 It force-closes any open position on the last bar so results are fully realized.
 Set `BACKTEST_DAYS` in `.env` to change the window.
+Backtest now aborts early on stale/frozen data runs to avoid tuning on bad inputs.
+
+## Diagnose feed vs market data
+
+Compare bot log market_data rows with actual Alpaca bars for the same UTC window:
+
+```bash
+python scripts/diagnose_data_feed.py --log logs/bot_20260223_010150_utc.log --start 2026-02-23T01:01:00Z --end 2026-02-23T06:41:00Z
+```
+
+This prints JSON with unique-close counts and max repeated-close run lengths for both sources.
 
 ## Sweep (auto-tune simple signals)
 

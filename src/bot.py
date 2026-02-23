@@ -60,6 +60,9 @@ class Config:
     runtime_params_file: str
     model_confidence_threshold: float
     model_train_days: int
+    max_stale_polls: int
+    max_bar_age_seconds: int
+    stale_event_reset_after: int
 
 
 def get_env_float(name: str, default: float) -> float:
@@ -136,6 +139,9 @@ def load_config() -> Config:
         ),
         model_confidence_threshold=get_env_float("MODEL_CONFIDENCE_THRESHOLD", 0.55),
         model_train_days=get_env_int("MODEL_TRAIN_DAYS", 30),
+        max_stale_polls=get_env_int("MAX_STALE_POLLS", 4),
+        max_bar_age_seconds=get_env_int("MAX_BAR_AGE_SECONDS", 180),
+        stale_event_reset_after=get_env_int("STALE_EVENT_RESET_AFTER", 3),
     )
 
 
@@ -168,19 +174,26 @@ class AlpacaRest:
         response.raise_for_status()
         return response.json()
 
-    def get_closes(self, limit: int) -> List[float]:
+    def get_recent_bars(self, limit: int, end: Optional[datetime] = None) -> List[Dict[str, Any]]:
         url = f"{self.cfg.data_base_url}/v1beta3/crypto/us/bars"
         params = {
             "symbols": self.cfg.data_symbol,
             "timeframe": "1Min",
             "limit": limit,
+            "sort": "asc",
         }
+        if end is not None:
+            params["end"] = end.isoformat().replace("+00:00", "Z")
         response = requests.get(url, headers=self.data_headers, params=params, timeout=20)
         response.raise_for_status()
         data = response.json()
 
         bars_by_symbol = data.get("bars", {})
         bars = bars_by_symbol.get(self.cfg.data_symbol, [])
+        return bars
+
+    def get_closes(self, limit: int, end: Optional[datetime] = None) -> List[float]:
+        bars = self.get_recent_bars(limit=limit, end=end)
         return [float(bar["c"]) for bar in bars]
 
     def get_historical_bars(self, days: int) -> List[Dict[str, Any]]:
@@ -516,6 +529,9 @@ def run() -> None:
     position_opened_at: Optional[float] = None
     cooldown_until: float = 0.0
     runtime_signature = ""
+    last_seen_bar_ts: Optional[datetime] = None
+    stale_poll_count = 0
+    stale_event_count = 0
 
     # Fetch actual account cash at startup
     try:
@@ -542,6 +558,9 @@ def run() -> None:
         rsi_max=cfg.rsi_max,
         momentum_lookback=cfg.momentum_lookback,
         min_momentum_pct=cfg.min_momentum_pct,
+        max_stale_polls=cfg.max_stale_polls,
+        max_bar_age_seconds=cfg.max_bar_age_seconds,
+        stale_event_reset_after=cfg.stale_event_reset_after,
         trade_log_file=cfg.trade_log_file,
         auto_sweep=cfg.auto_sweep,
         sweep_refresh_minutes=cfg.sweep_refresh_minutes,
@@ -671,9 +690,56 @@ def run() -> None:
                         time.sleep(cfg.poll_seconds)
                         continue
 
-                    closes = api.get_closes(cfg.bar_limit)
-                    if len(closes) == 0:
+                    bars = api.get_recent_bars(
+                        limit=cfg.bar_limit,
+                        end=datetime.now(timezone.utc),
+                    )
+                    if len(bars) == 0:
                         emit("error", message="No bars received from API")
+                        time.sleep(cfg.poll_seconds)
+                        continue
+
+                    closes = [float(bar["c"]) for bar in bars]
+                    latest_bar_ts = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00"))
+                    bar_age_seconds = int((datetime.now(timezone.utc) - latest_bar_ts).total_seconds())
+
+                    stale_reasons: List[str] = []
+                    if last_seen_bar_ts is not None and latest_bar_ts <= last_seen_bar_ts:
+                        stale_poll_count += 1
+                        stale_reasons.append("latest_bar_not_advanced")
+                    else:
+                        stale_poll_count = 0
+                        last_seen_bar_ts = latest_bar_ts
+
+                    if bar_age_seconds > cfg.max_bar_age_seconds:
+                        stale_reasons.append("latest_bar_too_old")
+
+                    if stale_reasons and stale_poll_count >= cfg.max_stale_polls:
+                        stale_event_count += 1
+                        emit(
+                            "market_data_stale",
+                            reasons=stale_reasons,
+                            stale_poll_count=stale_poll_count,
+                            stale_event_count=stale_event_count,
+                            latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
+                            bar_age_seconds=bar_age_seconds,
+                            max_stale_polls=cfg.max_stale_polls,
+                            max_bar_age_seconds=cfg.max_bar_age_seconds,
+                            stale_event_reset_after=cfg.stale_event_reset_after,
+                        )
+
+                        if stale_event_count >= max(cfg.stale_event_reset_after, 1):
+                            api = AlpacaRest(cfg)
+                            last_seen_bar_ts = None
+                            stale_poll_count = 0
+                            stale_event_count = 0
+                            emit(
+                                "data_client_reset",
+                                reason="stale_market_data_threshold",
+                                action="recreate_alpaca_client",
+                            )
+
+                        emit("decision", action="wait_stale_market_data")
                         time.sleep(cfg.poll_seconds)
                         continue
                     
@@ -693,6 +759,9 @@ def run() -> None:
                         enough_data=signal["enough_data"],
                         model_probability=round(signal["model_probability"], 4) if signal.get("model_probability") is not None else None,
                         model_used=signal.get("model_used", False),
+                        latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
+                        bar_age_seconds=bar_age_seconds,
+                        stale_poll_count=stale_poll_count,
                         signal_enter=enter_now,
                     )
 

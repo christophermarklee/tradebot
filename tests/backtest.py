@@ -65,6 +65,38 @@ def fetch_recent_bars(cfg: Config, days: int) -> List[Dict[str, Any]]:
     return bars
 
 
+def analyze_bar_quality(bars: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not bars:
+        return {
+            "total_bars": 0,
+            "unique_close_count": 0,
+            "max_same_close_run": 0,
+            "same_close_adjacent_pairs": 0,
+        }
+
+    closes = [float(bar["c"]) for bar in bars]
+    unique_close_count = len(set(closes))
+
+    max_same_close_run = 1
+    current_run = 1
+    same_close_adjacent_pairs = 0
+    for i in range(1, len(closes)):
+        if closes[i] == closes[i - 1]:
+            current_run += 1
+            same_close_adjacent_pairs += 1
+            if current_run > max_same_close_run:
+                max_same_close_run = current_run
+        else:
+            current_run = 1
+
+    return {
+        "total_bars": len(bars),
+        "unique_close_count": unique_close_count,
+        "max_same_close_run": max_same_close_run,
+        "same_close_adjacent_pairs": same_close_adjacent_pairs,
+    }
+
+
 def run_backtest() -> None:
     cfg = load_config()
     days = int(get_config_value("BACKTEST_DAYS", "3"))
@@ -89,6 +121,15 @@ def run_backtest() -> None:
     if not bars:
         print("No bars returned for requested period. Check symbol and API credentials.")
         return
+
+    quality = analyze_bar_quality(bars)
+    max_stale_run_allowed = int(get_config_value("BACKTEST_MAX_STALE_RUN", "30"))
+    if quality["max_same_close_run"] >= max_stale_run_allowed:
+        raise RuntimeError(
+            "Backtest aborted due to stale data quality: "
+            f"max_same_close_run={int(quality['max_same_close_run'])} "
+            f">= BACKTEST_MAX_STALE_RUN={max_stale_run_allowed}"
+        )
 
     cash = starting_cash
     qty = 0.0
@@ -245,6 +286,12 @@ def run_backtest() -> None:
     else:
         print("Runtime params applied: none (using .env defaults)")
     print(f"Bars: {len(bars)}")
+    print(
+        "Bar quality: "
+        f"unique_closes={int(quality['unique_close_count'])}, "
+        f"same_close_adjacent_pairs={int(quality['same_close_adjacent_pairs'])}, "
+        f"max_same_close_run={int(quality['max_same_close_run'])}"
+    )
     print(f"Starting cash (from account): ${starting_cash:,.2f}")
     print(f"Ending equity: ${equity:,.2f}")
     print(f"Realized PnL: ${realized_pnl:,.2f}")

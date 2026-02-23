@@ -112,13 +112,30 @@ bash scripts/run_production_session.sh
 
 Defaults:
 - `DURATION_HOURS=12`
-- `PREPARE_MODEL=true` (runs GPU warmup + model training before bot loop)
+- `PREPARE_MODEL=false` (uses existing model; safest default for long runs)
 - hard timeout with graceful kill window
+- periodic retraining enabled: `AUTO_MODEL_RETRAIN=true`
+- periodic retraining uses GPU by default: `MODEL_REQUIRE_GPU=true`
+- retraining interpreter pinned to production interpreter (`MODEL_TRAIN_PYTHON` defaults to `PYTHON_BIN`)
+
+Run this directly (recommended):
+
+```bash
+bash scripts/run_production_session.sh
+```
+
+Avoid launching via `uv run` for this script, because resolver updates can replace a custom TensorFlow wheel.
 
 Useful overrides:
 
 ```bash
-DURATION_HOURS=12 PREPARE_MODEL=true MODEL_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
+DURATION_HOURS=12 PREPARE_MODEL=true PREPARE_MODEL_STRICT=false MODEL_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
+```
+
+Tune periodic retraining cadence for long sessions:
+
+```bash
+DURATION_HOURS=12 MODEL_REFRESH_MINUTES=180 MODEL_TRAIN_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
 ```
 
 After completion, the script writes:

@@ -1,21 +1,21 @@
-name: TradeBot Fedora 43 Continuous
+name: TradeBot Continuous
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: tradebot-fedora43-continuous
+  group: tradebot-continuous
   cancel-in-progress: false
 
 jobs:
   run-bot:
-    runs-on: [self-hosted, linux, fedora-43]
+    runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       CHUNK_MINUTES: "340"
@@ -42,8 +42,8 @@ jobs:
             exit 1
           fi
           cat > .env << 'EOF'
-${{ secrets.BOT_ENV }}
-EOF
+          ${{ secrets.BOT_ENV }}
+          EOF
 
       - name: Run bot chunk
         shell: bash
@@ -58,5 +58,5 @@ EOF
           curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/tradebot-fedora43.yml/dispatches \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/tradebot-continuous.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'

@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-ROOT = Path(__file__).resolve().parent
+SRC_DIR = Path(__file__).resolve().parent
+ROOT = SRC_DIR.parent
 BACKTEST_PATH = ROOT / "tests" / "backtest.py"
-DEFAULT_RUNTIME_PARAMS_PATH = ROOT / "runtime_params.json"
+DEFAULT_RUNTIME_PARAMS_PATH = SRC_DIR / "runtime_params.json"
 
 
 def run_backtest_with_env(overrides: Dict[str, str]) -> Optional[Dict[str, float]]:

@@ -8,7 +8,7 @@ printf 'Starting bot chunk for %s minutes\n' "$CHUNK_MINUTES"
 
 if command -v timeout >/dev/null 2>&1; then
   set +e
-  timeout "${CHUNK_MINUTES}m" "$PYTHON_BIN" bot.py
+  timeout "${CHUNK_MINUTES}m" "$PYTHON_BIN" src/bot.py
   exit_code=$?
   set -e
 
@@ -26,4 +26,4 @@ if command -v timeout >/dev/null 2>&1; then
 fi
 
 echo "GNU timeout not found. Running bot without chunk timeout."
-"$PYTHON_BIN" bot.py
+"$PYTHON_BIN" src/bot.py

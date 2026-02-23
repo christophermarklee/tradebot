@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+SRC_DIR = Path(__file__).resolve().parent
+
 
 @dataclass
 class Config:
@@ -113,7 +115,10 @@ def load_config() -> Config:
         sweep_quiet=get_env_bool("SWEEP_QUIET", True),
         auto_sweep=get_env_bool("AUTO_SWEEP", True),
         sweep_refresh_minutes=get_env_int("SWEEP_REFRESH_MINUTES", 240),
-        runtime_params_file=os.getenv("RUNTIME_PARAMS_FILE", "runtime_params.json"),
+        runtime_params_file=os.getenv(
+            "RUNTIME_PARAMS_FILE",
+            str(SRC_DIR / "runtime_params.json"),
+        ),
     )
 
 
@@ -376,7 +381,10 @@ def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
         runtime_params_file=cfg.runtime_params_file,
     )
     try:
-        import sweeps
+        try:
+            import sweeps
+        except ModuleNotFoundError:
+            from src import sweeps
 
         best = sweeps.run_sweep(
             backtest_days=cfg.backtest_days,

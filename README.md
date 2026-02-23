@@ -27,7 +27,7 @@ It uses a default starting budget assumption of **$10,000** per trade cycle.
 ## 2) Run
 
 ```bash
-python bot.py
+python src/bot.py
 ```
 
 ## Config
@@ -49,7 +49,7 @@ Use `.env` values:
 - `SWEEP_QUIET=true`
 - `AUTO_SWEEP=true`
 - `SWEEP_REFRESH_MINUTES=240`
-- `RUNTIME_PARAMS_FILE=runtime_params.json`
+- `RUNTIME_PARAMS_FILE=src/runtime_params.json`
 - `TRADE_SYMBOL=BTCUSD`
 - `DATA_SYMBOL=BTC/USD`
 - `POLL_SECONDS=20`
@@ -70,7 +70,7 @@ Set `BACKTEST_DAYS` in `.env` to change the window.
 Run a small grid search over RSI/momentum/hold settings:
 
 ```bash
-python sweeps.py
+python src/sweeps.py
 ```
 
 It uses `BACKTEST_DAYS` (default `3`) and ranks by a combined score:
@@ -78,32 +78,31 @@ It uses `BACKTEST_DAYS` (default `3`) and ranks by a combined score:
 - more closed trades
 - lower max drawdown
 
-It writes the best parameters to `runtime_params.json` in project root.
+It writes the best parameters to `src/runtime_params.json`.
 
-`bot.py` auto-runs sweeps when `AUTO_SWEEP=true` and `runtime_params.json` is missing/stale, then reloads and applies those params each loop.
+`bot.py` auto-runs sweeps when `AUTO_SWEEP=true` and `src/runtime_params.json` is missing/stale, then reloads and applies those params each loop.
 
 ## Notes
 - Start on **paper trading** first.
 - This is intentionally minimal and not financial advice.
 - No guarantee of profits; markets can move against you.
 
-## GitHub Actions (Fedora 43)
+## GitHub Actions (GitHub-hosted)
 
-This repo includes a continuous-style workflow at `.github/workflows/tradebot-fedora43.yml`.
+This repo includes a continuous-style workflow at `.github/workflows/tradebot-continuous.yml`.
 
 ### Requirements
-- A **self-hosted** GitHub runner with labels: `self-hosted`, `linux`, `fedora-43`
 - Repository secret `BOT_ENV` containing full `.env` content
 - Repo setting: **Actions > General > Workflow permissions = Read and write permissions**
 
 ### Start it
 1. Push this repo.
 2. Add the `BOT_ENV` secret.
-3. Run workflow **TradeBot Fedora 43 Continuous** via `workflow_dispatch`.
+3. Run workflow **TradeBot Continuous** via `workflow_dispatch`.
 
 ### How it stays running
 - Each job runs the bot in a long chunk (`CHUNK_MINUTES=340`).
 - At the end of each run, the workflow dispatches itself again.
-- A backup cron trigger runs every 30 minutes.
+- A backup cron trigger runs every hour.
 
 This is the closest safe continuous mode in Actions. For truly always-on execution, a long-lived system service on the runner is still more reliable.

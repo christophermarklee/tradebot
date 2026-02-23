@@ -10,8 +10,9 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from bot import (  # noqa: E402
     Config,
@@ -65,7 +66,7 @@ def fetch_recent_bars(cfg: Config, days: int) -> List[Dict[str, Any]]:
 def run_backtest() -> None:
     cfg = load_config()
     days = int(os.getenv("BACKTEST_DAYS", "3"))
-    runtime_params_file = os.getenv("RUNTIME_PARAMS_FILE", "runtime_params.json")
+    runtime_params_file = os.getenv("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
     runtime_params = load_runtime_params(runtime_params_file)
     if runtime_params:
         apply_runtime_params(cfg, runtime_params)

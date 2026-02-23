@@ -70,8 +70,8 @@ jobs:
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-          git add src/runtime_params.json
-          git commit -m "Update runtime_params.json [skip ci]" || echo "No changes to commit"
+          git add src/runtime_params.json src/model.keras
+          git commit -m "Update runtime_params.json and model.keras [skip ci]" || echo "No changes to commit"
           git push
 
       - name: Re-dispatch workflow

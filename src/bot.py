@@ -2,7 +2,7 @@ import os
 import json
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +58,8 @@ class Config:
     auto_sweep: bool
     sweep_refresh_minutes: int
     runtime_params_file: str
+    model_confidence_threshold: float
+    model_train_days: int
 
 
 def get_env_float(name: str, default: float) -> float:
@@ -132,6 +134,8 @@ def load_config() -> Config:
             "RUNTIME_PARAMS_FILE",
             str(SRC_DIR / "runtime_params.json"),
         ),
+        model_confidence_threshold=get_env_float("MODEL_CONFIDENCE_THRESHOLD", 0.55),
+        model_train_days=get_env_int("MODEL_TRAIN_DAYS", 30),
     )
 
 
@@ -178,6 +182,32 @@ class AlpacaRest:
         bars_by_symbol = data.get("bars", {})
         bars = bars_by_symbol.get(self.cfg.data_symbol, [])
         return [float(bar["c"]) for bar in bars]
+
+    def get_historical_bars(self, days: int) -> List[Dict[str, Any]]:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        url = f"{self.cfg.data_base_url}/v1beta3/crypto/us/bars"
+        bars: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {
+                "symbols": self.cfg.data_symbol,
+                "timeframe": "1Min",
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "sort": "asc",
+                "limit": 1000,
+            }
+            if page_token:
+                params["page_token"] = page_token
+            response = requests.get(url, headers=self.data_headers, params=params, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            bars.extend(payload.get("bars", {}).get(self.cfg.data_symbol, []))
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+        return bars
 
     def submit_buy_notional(self, notional_usd: float) -> dict:
         url = f"{self.cfg.trade_base_url}/v2/orders"
@@ -282,7 +312,31 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
     momentum_pct = ((closes[-1] / momentum_base) - 1.0) * 100.0
     momentum_ok = momentum_pct >= cfg.min_momentum_pct
 
-    enter = trend_ok and rsi_ok and momentum_ok
+    rules_enter = trend_ok and rsi_ok and momentum_ok
+
+    # Try model prediction — returns None when model is unavailable (graceful fallback)
+    model_prob: Optional[float] = None
+    try:
+        try:
+            import model as _model_module
+        except ModuleNotFoundError:
+            from src import model as _model_module  # type: ignore[no-redef]
+        model_prob = _model_module.predict_entry(
+            closes,
+            short_window=cfg.short_window,
+            long_window=cfg.long_window,
+            rsi_window=cfg.rsi_window,
+            momentum_lookback=cfg.momentum_lookback,
+        )
+    except Exception:
+        model_prob = None
+
+    enter = (
+        model_prob >= cfg.model_confidence_threshold
+        if model_prob is not None
+        else rules_enter
+    )
+
     return {
         "enter": enter,
         "enough_data": True,
@@ -293,6 +347,8 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
         "rsi_ok": rsi_ok,
         "momentum_pct": momentum_pct,
         "momentum_ok": momentum_ok,
+        "model_probability": model_prob,
+        "model_used": model_prob is not None,
     }
 
 
@@ -382,7 +438,35 @@ def apply_runtime_params(cfg: Config, params: Dict[str, Any]) -> None:
                 continue
 
 
-def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
+def _maybe_retrain_model(cfg: Config, api: "AlpacaRest") -> None:
+    """Fetch historical bars and retrain the TF entry signal model."""
+    try:
+        try:
+            import model as _model_module
+        except ModuleNotFoundError:
+            from src import model as _model_module  # type: ignore[no-redef]
+        emit("model_train_start", days=cfg.model_train_days)
+        bars = api.get_historical_bars(cfg.model_train_days)
+        if len(bars) < 200:
+            emit("model_train_skip", reason="insufficient_data", bars=len(bars))
+            return
+        target_pct = (cfg.target_profit_usd / max(cfg.starting_balance_usd, 1.0)) * 100.0
+        metrics = _model_module.train_model(
+            bars=bars,
+            target_pct=target_pct,
+            max_horizon=cfg.max_hold_minutes,
+            short_window=cfg.short_window,
+            long_window=cfg.long_window,
+            rsi_window=cfg.rsi_window,
+            momentum_lookback=cfg.momentum_lookback,
+            quiet=cfg.sweep_quiet,
+        )
+        emit("model_train_complete", **metrics)
+    except Exception as err:
+        emit("error", message=f"Model training failed: {err}")
+
+
+def maybe_refresh_runtime_params(cfg: Config, now_ts: float, api: Optional["AlpacaRest"] = None) -> None:
     if not cfg.auto_sweep:
         return
 
@@ -417,6 +501,8 @@ def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
             equity=round(float(best["equity"]), 2),
             pnl=round(float(best["pnl"]), 2),
         )
+        if api is not None:
+            _maybe_retrain_model(cfg, api)
     except Exception as err:
         emit("error", message=f"Auto sweep failed: {err}")
 
@@ -488,7 +574,7 @@ def run() -> None:
         while True:
             try:
                 now_ts = time.time()
-                maybe_refresh_runtime_params(cfg, now_ts)
+                maybe_refresh_runtime_params(cfg, now_ts, api=api)
 
                 runtime_params = load_runtime_params(cfg.runtime_params_file)
                 if runtime_params:
@@ -605,6 +691,8 @@ def run() -> None:
                         momentum_pct=round(signal["momentum_pct"], 4) if signal["momentum_pct"] is not None else None,
                         momentum_ok=signal["momentum_ok"],
                         enough_data=signal["enough_data"],
+                        model_probability=round(signal["model_probability"], 4) if signal.get("model_probability") is not None else None,
+                        model_used=signal.get("model_used", False),
                         signal_enter=enter_now,
                     )
 

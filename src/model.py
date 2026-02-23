@@ -20,9 +20,11 @@ Feature vector (FEATURE_WINDOW + 4 values):
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import subprocess
 import sys
+import site
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -43,6 +45,114 @@ _gpu_configured = False
 _gpu_device_info: Optional[str] = None
 
 
+def _env_truthy(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _prepare_cuda_jit_cache() -> None:
+    if os.getenv("CUDA_CACHE_PATH"):
+        cache_path = Path(os.getenv("CUDA_CACHE_PATH", "")).expanduser()
+    else:
+        cache_path = Path.home() / ".nv" / "ComputeCache"
+        os.environ["CUDA_CACHE_PATH"] = str(cache_path)
+
+    cache_path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("CUDA_CACHE_DISABLE", "0")
+    os.environ.setdefault("CUDA_CACHE_MAXSIZE", "2147483648")
+    if _env_truthy("MODEL_FORCE_PTX_JIT", "false"):
+        os.environ["CUDA_FORCE_PTX_JIT"] = "1"
+
+
+def _configure_cuda_library_path() -> None:
+    if os.name != "posix":
+        return
+
+    lib_paths: List[str] = []
+
+    def _collect(base: Path) -> None:
+        nvidia_root = base / "nvidia"
+        if not nvidia_root.exists():
+            return
+        for child in nvidia_root.iterdir():
+            if not child.is_dir():
+                continue
+            for sub in ("lib", "lib64", "bin"):
+                candidate = child / sub
+                if candidate.exists() and candidate.is_dir():
+                    lib_paths.append(str(candidate))
+
+    for p in site.getsitepackages():
+        _collect(Path(p))
+    user_site = site.getusersitepackages()
+    if user_site:
+        _collect(Path(user_site))
+
+    if not lib_paths:
+        return
+
+    existing = os.getenv("LD_LIBRARY_PATH", "")
+    existing_parts = [part for part in existing.split(":") if part]
+    merged: List[str] = []
+    for path in lib_paths + existing_parts:
+        if path not in merged:
+            merged.append(path)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(merged)
+
+    for base in lib_paths:
+        candidate = Path(base) / "libcusolver.so.11"
+        if candidate.exists():
+            try:
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+            break
+
+
+def _warmup_gpu_kernels(feature_dim: int, quiet: bool, require_gpu: bool = False) -> bool:
+    if not _env_truthy("MODEL_GPU_WARMUP", "true"):
+        return False
+
+    try:
+        _configure_cuda_library_path()
+        import tensorflow as tf
+        from tensorflow import keras
+        from tensorflow.keras import layers  # type: ignore[attr-defined]
+
+        gpus = tf.config.list_physical_devices("GPU")
+        if not gpus:
+            if require_gpu:
+                raise RuntimeError("GPU required but no TensorFlow GPU device was detected")
+            return False
+
+        warmup_model = keras.Sequential(
+            [
+                layers.Input(shape=(feature_dim,)),
+                layers.Dense(128, activation="relu"),
+                layers.Dense(1, activation="sigmoid", dtype="float32"),
+            ]
+        )
+        warmup_model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+            loss="binary_crossentropy",
+        )
+
+        x = np.random.default_rng(7).random((2048, feature_dim), dtype=np.float32)
+        y = np.random.default_rng(11).integers(0, 2, size=(2048, 1)).astype(np.float32)
+
+        warmup_model.fit(x, y, epochs=1, batch_size=256, verbose=0)
+        warmup_model.predict(x[:64], verbose=0)
+
+        if not quiet:
+            print("[model] GPU kernel warm-up complete (PTX JIT cache primed)")
+        return True
+    except Exception as exc:
+        if require_gpu:
+            raise RuntimeError(f"GPU warm-up failed: {exc}") from exc
+        if not quiet:
+            print(f"[model] GPU warm-up skipped: {exc}")
+        return False
+
+
 def configure_gpu() -> str:
     """Configure TensorFlow GPU: memory growth and optional perf flags.
 
@@ -50,6 +160,7 @@ def configure_gpu() -> str:
     Silently no-ops if TensorFlow or cuDNN is unavailable.
     """
     try:
+        _configure_cuda_library_path()
         import tensorflow as tf
 
         # Allow GPU memory to grow incrementally instead of claiming all VRAM up front
@@ -58,20 +169,8 @@ def configure_gpu() -> str:
             tf.config.experimental.set_memory_growth(gpu, True)
 
         if gpus:
-            use_mixed_precision = os.getenv("MODEL_USE_MIXED_PRECISION", "false").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-            }
-            use_xla = os.getenv("MODEL_USE_XLA", "false").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-            }
+            use_mixed_precision = _env_truthy("MODEL_USE_MIXED_PRECISION", "false")
+            use_xla = _env_truthy("MODEL_USE_XLA", "false")
 
             if use_mixed_precision:
                 from tensorflow.keras import mixed_precision  # type: ignore[attr-defined]
@@ -207,6 +306,8 @@ def train_model(
     Returns a dict of training metrics.
     """
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    _prepare_cuda_jit_cache()
+    _configure_cuda_library_path()
     try:
         from tensorflow import keras
         from tensorflow.keras import layers  # type: ignore[attr-defined]
@@ -242,6 +343,10 @@ def train_model(
     split = int(len(X) * 0.8)
     X_train, X_val = X[idx[:split]], X[idx[split:]]
     y_train, y_val = y[idx[:split]], y[idx[split:]]
+
+    _warmup_gpu_kernels(
+        X.shape[1], quiet, require_gpu=_env_truthy("MODEL_REQUIRE_GPU", "false")
+    )
 
     # Normalization baked into the model so it is saved in model.keras
     norm_layer = layers.Normalization(axis=-1)
@@ -341,6 +446,8 @@ def predict_entry(
 
     try:
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        _prepare_cuda_jit_cache()
+        _configure_cuda_library_path()
         import tensorflow as tf  # noqa: F401
     except ImportError:
         return None
@@ -388,6 +495,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force CPU-only training run (disables visible CUDA devices)",
     )
+    parser.add_argument(
+        "--warmup-only",
+        action="store_true",
+        help="Only run GPU kernel warm-up (PTX JIT compile/cache) and exit",
+    )
+    parser.add_argument(
+        "--warmup-feature-dim",
+        type=int,
+        default=FEATURE_WINDOW + 4,
+        help="Feature width used for warm-up tensors when --warmup-only is set",
+    )
     return parser.parse_args()
 
 
@@ -396,6 +514,18 @@ def main() -> None:
 
     if args.cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    _prepare_cuda_jit_cache()
+
+    if args.warmup_only:
+        _configure_gpu_once()
+        _warmup_gpu_kernels(
+            max(8, int(args.warmup_feature_dim)),
+            quiet=False,
+            require_gpu=_env_truthy("MODEL_REQUIRE_GPU", "false"),
+        )
+        print("GPU warm-up complete.")
+        raise SystemExit(0)
 
     try:
         try:
@@ -427,6 +557,13 @@ def main() -> None:
         print(f"Metrics: {metrics}")
     except Exception as exc:
         if "CUDA_ERROR_INVALID_HANDLE" in str(exc) and not args.cpu:
+            if _env_truthy("MODEL_REQUIRE_GPU", "false"):
+                print(
+                    "Model training failed on GPU and MODEL_REQUIRE_GPU=true; not falling back to CPU.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2) from exc
+
             retry_cmd = [sys.executable, str(Path(__file__).resolve())]
             if args.days is not None:
                 retry_cmd.extend(["--days", str(args.days)])

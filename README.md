@@ -63,6 +63,33 @@ When running `src/bot.py`, the bot can also retrain this model periodically usin
 - `MODEL_TRAIN_PYTHON=.venv/bin/python`
 
 If `src/model.keras` is missing or older than `MODEL_REFRESH_MINUTES`, bot auto-triggers retraining.
+
+### RTX 5090: build TensorFlow from source (sm_120)
+
+If prebuilt TensorFlow wheels do not run reliably on compute capability `12.0`, build a local wheel targeting `sm_120`:
+
+```bash
+scripts/build_tensorflow_sm120.sh
+```
+
+This script will:
+- sync deps with `uv`
+- clone/update TensorFlow source in `.tensorflow-src/`
+- configure CUDA build with `TF_CUDA_COMPUTE_CAPABILITIES=12.0`
+- build a wheel via `bazelisk`
+- install that wheel into `.venv`
+
+Useful overrides:
+
+```bash
+TF_REF=master CUDA_CC=12.0 JOBS=32 scripts/build_tensorflow_sm120.sh
+```
+
+After install, verify GPU visibility:
+
+```bash
+uv run --python 3.13 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
+```
 4. Copy `.env.example` to `.env` and add your Alpaca API credentials:
    ```
    APCA_API_KEY_ID=your_key_here

@@ -77,7 +77,10 @@ This script will:
 - clone/update TensorFlow source in `.tensorflow-src/`
 - configure CUDA build with `TF_CUDA_COMPUTE_CAPABILITIES=12.0`
 - build a wheel via `bazelisk`
-- install that wheel into `.venv`
+- stage the wheel at `.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl`
+- install that staged local wheel into `.venv`
+
+`pyproject.toml` is pinned so `uv` resolves `tensorflow` from `.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl` only.
 
 Useful overrides:
 
@@ -107,35 +110,39 @@ python src/bot.py
 Run a bounded production session with one command:
 
 ```bash
-bash scripts/run_production_session.sh
+uv run scripts/run_production_session.sh
 ```
 
 Defaults:
 - `DURATION_HOURS=12`
-- `PREPARE_MODEL=false` (uses existing model; safest default for long runs)
+- `SESSION_TAG=gpuprod`
+- `PREPARE_MODEL=true` (trains a fresh model at startup)
+- `PREPARE_MODEL_STRICT=true` (aborts startup if a fresh model is not produced)
 - hard timeout with graceful kill window
 - periodic retraining enabled: `AUTO_MODEL_RETRAIN=true`
 - periodic retraining uses GPU by default: `MODEL_REQUIRE_GPU=true`
 - retraining interpreter pinned to production interpreter (`MODEL_TRAIN_PYTHON` defaults to `PYTHON_BIN`)
+- startup prep falls back to direct retrain with GPU required (GPU warmup disabled) if warmup path fails
+- local TensorFlow wheel is required: `MODEL_LOCAL_TF_WHEEL_PATH=.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl`
 
-Run this directly (recommended):
+Run with `uv` (recommended):
 
 ```bash
-bash scripts/run_production_session.sh
+uv run scripts/run_production_session.sh
 ```
 
-Avoid launching via `uv run` for this script, because resolver updates can replace a custom TensorFlow wheel.
+Press `Ctrl-C` to stop early; the script traps the interrupt, stops child processes, and exits with status `130`.
 
 Useful overrides:
 
 ```bash
-DURATION_HOURS=12 PREPARE_MODEL=true PREPARE_MODEL_STRICT=false MODEL_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
+DURATION_HOURS=12 PREPARE_MODEL=true PREPARE_MODEL_STRICT=false MODEL_DAYS=7 SESSION_TAG=prod uv run scripts/run_production_session.sh
 ```
 
 Tune periodic retraining cadence for long sessions:
 
 ```bash
-DURATION_HOURS=12 MODEL_REFRESH_MINUTES=180 MODEL_TRAIN_DAYS=7 SESSION_TAG=prod bash scripts/run_production_session.sh
+DURATION_HOURS=12 MODEL_REFRESH_MINUTES=180 MODEL_TRAIN_DAYS=7 SESSION_TAG=prod uv run scripts/run_production_session.sh
 ```
 
 After completion, the script writes:
@@ -168,6 +175,8 @@ All bot behavior settings are stored here. You can edit this file to change defa
 - `MAX_STALE_POLLS`: Number of consecutive stale polls before entry is paused
 - `MAX_BAR_AGE_SECONDS`: Max allowed age for latest bar before feed is treated as stale
 - `STALE_EVENT_RESET_AFTER`: Number of stale-data events before bot recreates Alpaca client automatically
+- `BUY_FILL_TIMEOUT_MINUTES`: Max minutes to wait for a buy fill before cancel/reset (default `15`)
+- `SELL_FILL_TIMEOUT_MINUTES`: Max minutes to wait for a sell fill before cancel/reset (default `15`)
 - `BACKTEST_MAX_STALE_RUN`: Abort backtest if too many consecutive identical closes are seen
 - And more...
 

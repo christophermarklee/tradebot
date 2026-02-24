@@ -64,6 +64,8 @@ class Config:
     auto_model_retrain: bool
     model_refresh_minutes: int
     model_train_python: str
+    buy_fill_timeout_minutes: int
+    sell_fill_timeout_minutes: int
     max_stale_polls: int
     max_bar_age_seconds: int
     stale_event_reset_after: int
@@ -146,6 +148,8 @@ def load_config() -> Config:
         auto_model_retrain=get_env_bool("AUTO_MODEL_RETRAIN", True),
         model_refresh_minutes=get_env_int("MODEL_REFRESH_MINUTES", 240),
         model_train_python=get_config_value("MODEL_TRAIN_PYTHON", ".venv/bin/python"),
+        buy_fill_timeout_minutes=get_env_int("BUY_FILL_TIMEOUT_MINUTES", 15),
+        sell_fill_timeout_minutes=get_env_int("SELL_FILL_TIMEOUT_MINUTES", 15),
         max_stale_polls=get_env_int("MAX_STALE_POLLS", 4),
         max_bar_age_seconds=get_env_int("MAX_BAR_AGE_SECONDS", 180),
         stale_event_reset_after=get_env_int("STALE_EVENT_RESET_AFTER", 3),
@@ -255,6 +259,21 @@ class AlpacaRest:
         response.raise_for_status()
         return response.json()
 
+    def get_order(self, order_id: str) -> Optional[dict]:
+        url = f"{self.cfg.trade_base_url}/v2/orders/{order_id}"
+        response = requests.get(url, headers=self.trade_headers, timeout=20)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    def cancel_order(self, order_id: str) -> None:
+        url = f"{self.cfg.trade_base_url}/v2/orders/{order_id}"
+        response = requests.delete(url, headers=self.trade_headers, timeout=20)
+        if response.status_code in (404, 422):
+            return
+        response.raise_for_status()
+
 
 def close_open_position(api: AlpacaRest) -> None:
     position = api.get_position()
@@ -316,6 +335,9 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
             "rsi_ok": False,
             "momentum_pct": None,
             "momentum_ok": False,
+            "model_probability": None,
+            "model_used": False,
+            "model_skip_reason": f"insufficient_rule_bars_need_{needed}_got_{len(closes)}",
         }
 
     short_sma = sma(closes, cfg.short_window)
@@ -337,21 +359,32 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
 
     # Try model prediction — returns None when model is unavailable (graceful fallback)
     model_prob: Optional[float] = None
+    model_skip_reason: Optional[str] = None
     if use_model:
         try:
             try:
                 import model as _model_module
             except ModuleNotFoundError:
                 from src import model as _model_module  # type: ignore[no-redef]
-            model_prob = _model_module.predict_entry(
-                closes,
-                short_window=cfg.short_window,
-                long_window=cfg.long_window,
-                rsi_window=cfg.rsi_window,
-                momentum_lookback=cfg.momentum_lookback,
-            )
-        except Exception:
+            model_feature_window = int(getattr(_model_module, "FEATURE_WINDOW", 50))
+            model_needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1, model_feature_window)
+            if len(closes) < model_needed:
+                model_skip_reason = f"insufficient_model_bars_need_{model_needed}_got_{len(closes)}"
+            else:
+                model_prob = _model_module.predict_entry(
+                    closes,
+                    short_window=cfg.short_window,
+                    long_window=cfg.long_window,
+                    rsi_window=cfg.rsi_window,
+                    momentum_lookback=cfg.momentum_lookback,
+                )
+                if model_prob is None:
+                    model_skip_reason = "predict_entry_returned_none"
+        except Exception as err:
             model_prob = None
+            model_skip_reason = f"predict_entry_exception_{type(err).__name__}"
+    else:
+        model_skip_reason = "model_disabled"
 
     enter = (
         model_prob >= cfg.model_confidence_threshold
@@ -371,6 +404,7 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
         "momentum_ok": momentum_ok,
         "model_probability": model_prob,
         "model_used": model_prob is not None,
+        "model_skip_reason": model_skip_reason,
     }
 
 
@@ -597,6 +631,8 @@ def run() -> None:
     last_seen_bar_ts: Optional[datetime] = None
     stale_poll_count = 0
     stale_event_count = 0
+    in_flight_order_id: Optional[str] = None
+    in_flight_submitted_at: Optional[float] = None
 
     # Fetch actual account cash at startup
     try:
@@ -618,6 +654,7 @@ def run() -> None:
         take_profit_buffer_usd=cfg.take_profit_buffer_usd,
         max_hold_minutes=cfg.max_hold_minutes,
         cooldown_minutes=cfg.cooldown_minutes,
+        bar_limit=cfg.bar_limit,
         rsi_window=cfg.rsi_window,
         rsi_min=cfg.rsi_min,
         rsi_max=cfg.rsi_max,
@@ -633,6 +670,7 @@ def run() -> None:
         auto_model_retrain=cfg.auto_model_retrain,
         model_refresh_minutes=cfg.model_refresh_minutes,
         model_train_python=cfg.model_train_python,
+        model_min_bars_required=max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1, 50),
     )
 
     # Warmup period: wait for sufficient historical data
@@ -685,19 +723,118 @@ def run() -> None:
 
                 if in_flight_side == "buy":
                     if position is None:
-                        emit("decision", action="wait_buy_fill")
+                        order_status = "unknown"
+                        if in_flight_order_id:
+                            order_data = api.get_order(in_flight_order_id)
+                            if order_data is not None:
+                                order_status = str(order_data.get("status", "unknown")).lower()
+                            else:
+                                order_status = "missing"
+
+                        buy_timeout_seconds = max(cfg.buy_fill_timeout_minutes, 1) * 60
+                        buy_fill_wait_seconds = (
+                            int(now_ts - in_flight_submitted_at)
+                            if in_flight_submitted_at is not None
+                            else 0
+                        )
+
+                        if order_status in {"canceled", "rejected", "expired", "suspended", "missing"}:
+                            emit(
+                                "error",
+                                message=(
+                                    "Buy order did not fill and is no longer active "
+                                    f"(status={order_status}); resetting in-flight state"
+                                ),
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        if buy_fill_wait_seconds >= buy_timeout_seconds:
+                            if in_flight_order_id:
+                                try:
+                                    api.cancel_order(in_flight_order_id)
+                                except Exception as cancel_err:
+                                    emit("error", message=f"Failed to cancel stale buy order: {cancel_err}")
+                            emit(
+                                "decision",
+                                action="buy_fill_timeout_reset",
+                                wait_seconds=buy_fill_wait_seconds,
+                                timeout_seconds=buy_timeout_seconds,
+                                order_status=order_status,
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        emit(
+                            "decision",
+                            action="wait_buy_fill",
+                            wait_seconds=buy_fill_wait_seconds,
+                            timeout_seconds=buy_timeout_seconds,
+                            order_status=order_status,
+                        )
                         time.sleep(cfg.poll_seconds)
                         continue
                     in_flight_side = None
+                    in_flight_order_id = None
+                    in_flight_submitted_at = None
                     position_opened_at = now_ts
                     emit("decision", action="buy_filled")
 
                 if in_flight_side == "sell":
                     if position is not None:
-                        emit("decision", action="wait_sell_fill")
+                        order_status = "unknown"
+                        if in_flight_order_id:
+                            order_data = api.get_order(in_flight_order_id)
+                            if order_data is not None:
+                                order_status = str(order_data.get("status", "unknown")).lower()
+                            else:
+                                order_status = "missing"
+
+                        sell_timeout_seconds = max(cfg.sell_fill_timeout_minutes, 1) * 60
+                        sell_fill_wait_seconds = (
+                            int(now_ts - in_flight_submitted_at)
+                            if in_flight_submitted_at is not None
+                            else 0
+                        )
+
+                        if sell_fill_wait_seconds >= sell_timeout_seconds:
+                            if in_flight_order_id:
+                                try:
+                                    api.cancel_order(in_flight_order_id)
+                                except Exception as cancel_err:
+                                    emit("error", message=f"Failed to cancel stale sell order: {cancel_err}")
+                            emit(
+                                "decision",
+                                action="sell_fill_timeout_reset",
+                                wait_seconds=sell_fill_wait_seconds,
+                                timeout_seconds=sell_timeout_seconds,
+                                order_status=order_status,
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            cooldown_until = now_ts + (cfg.cooldown_minutes * 60)
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        emit(
+                            "decision",
+                            action="wait_sell_fill",
+                            wait_seconds=sell_fill_wait_seconds,
+                            timeout_seconds=sell_timeout_seconds,
+                            order_status=order_status,
+                        )
                         time.sleep(cfg.poll_seconds)
                         continue
                     in_flight_side = None
+                    in_flight_order_id = None
+                    in_flight_submitted_at = None
                     cooldown_until = now_ts + (cfg.cooldown_minutes * 60)
                     position_opened_at = None
                     emit("decision", action="sell_filled_cooldown_started")
@@ -732,8 +869,10 @@ def run() -> None:
                         exit_reason = "max_hold"
 
                     if exit_reason:
-                        api.submit_sell_qty(qty)
+                        sell_order = api.submit_sell_qty(qty)
                         in_flight_side = "sell"
+                        in_flight_order_id = str(sell_order.get("id", "")) or None
+                        in_flight_submitted_at = now_ts
                         append_trade_log(
                             cfg=cfg,
                             side="sell",
@@ -828,6 +967,7 @@ def run() -> None:
                         enough_data=signal["enough_data"],
                         model_probability=round(signal["model_probability"], 4) if signal.get("model_probability") is not None else None,
                         model_used=signal.get("model_used", False),
+                        model_skip_reason=signal.get("model_skip_reason"),
                         latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
                         bar_age_seconds=bar_age_seconds,
                         stale_poll_count=stale_poll_count,
@@ -841,7 +981,7 @@ def run() -> None:
                         order_notional = cash * 0.98
 
                         if order_notional > 10:
-                            api.submit_buy_notional(order_notional)
+                            buy_order = api.submit_buy_notional(order_notional)
                             entry_price = closes[-1]
                             approx_qty = order_notional / entry_price
                             append_trade_log(
@@ -853,6 +993,8 @@ def run() -> None:
                                 reason="signal",
                             )
                             in_flight_side = "buy"
+                            in_flight_order_id = str(buy_order.get("id", "")) or None
+                            in_flight_submitted_at = now_ts
                             emit(
                                 "decision",
                                 action="submit_buy",
@@ -860,6 +1002,7 @@ def run() -> None:
                                 approx_qty=round(approx_qty, 8),
                                 entry_price=round(entry_price, 2),
                                 cash=round(cash, 2),
+                                order_id=in_flight_order_id,
                             )
                         else:
                             emit(

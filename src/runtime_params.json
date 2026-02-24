@@ -1,19 +1,19 @@
 {
-  "updated_at_utc": "2026-02-23T15:52:27.630599Z",
+  "updated_at_utc": "2026-02-24T00:36:08.565968Z",
   "backtest_days": 3,
   "best_params": {
     "RSI_MIN": "46",
     "RSI_MAX": "66",
     "MOMENTUM_LOOKBACK": "6",
-    "MIN_MOMENTUM_PCT": "0.08",
+    "MIN_MOMENTUM_PCT": "0.07",
     "TAKE_PROFIT_BUFFER_USD": "12",
-    "MAX_HOLD_MINUTES": "120"
+    "MAX_HOLD_MINUTES": "150"
   },
   "metrics": {
-    "equity": 10200.74,
-    "pnl": 200.74,
-    "max_drawdown_usd": 150.18,
-    "trades": 13,
-    "score": 10228.19
+    "equity": 9847.62,
+    "pnl": -152.38,
+    "max_drawdown_usd": 315.74,
+    "trades": 10,
+    "score": 9818.69
   }
 }

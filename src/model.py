@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import subprocess
 import sys
 import site
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -43,6 +45,7 @@ _cached_model_path: Optional[str] = None
 _cached_model_mtime: Optional[float] = None
 _gpu_configured = False
 _gpu_device_info: Optional[str] = None
+_tf_source_checked = False
 
 
 def _env_truthy(name: str, default: str = "false") -> bool:
@@ -61,6 +64,82 @@ def _prepare_cuda_jit_cache() -> None:
     os.environ.setdefault("CUDA_CACHE_MAXSIZE", "2147483648")
     if _env_truthy("MODEL_FORCE_PTX_JIT", "false"):
         os.environ["CUDA_FORCE_PTX_JIT"] = "1"
+
+
+def _file_url_to_path(url: str) -> Optional[Path]:
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path or "")
+    if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+        path = path[1:]
+    if not path:
+        return None
+    return Path(path).resolve()
+
+
+def _ensure_local_tensorflow_wheel() -> None:
+    global _tf_source_checked
+    if _tf_source_checked:
+        return
+    if not _env_truthy("MODEL_ENSURE_LOCAL_TF_WHEEL", "true"):
+        _tf_source_checked = True
+        return
+
+    expected_wheel = Path(
+        os.getenv(
+            "MODEL_LOCAL_TF_WHEEL_PATH",
+            str(
+                SRC_DIR.parent
+                / ".wheels"
+                / "tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl"
+            ),
+        )
+    ).expanduser().resolve()
+
+    if not expected_wheel.exists():
+        raise RuntimeError(
+            f"Local TensorFlow wheel required but missing: {expected_wheel}. "
+            "Build it with scripts/build_tensorflow_sm120.sh"
+        )
+
+    try:
+        from importlib import metadata as importlib_metadata
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(f"Unable to inspect TensorFlow package metadata: {exc}") from exc
+
+    try:
+        dist = importlib_metadata.distribution("tensorflow")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise ImportError(
+            "TensorFlow is not installed. Run scripts/build_tensorflow_sm120.sh to install the local wheel."
+        ) from exc
+
+    direct_url_raw = dist.read_text("direct_url.json")
+    if not direct_url_raw:
+        raise RuntimeError(
+            "TensorFlow must be installed from the staged local wheel, but package metadata has no direct_url.json"
+        )
+
+    try:
+        direct_url = json.loads(direct_url_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid TensorFlow direct_url.json: {exc}") from exc
+
+    installed_from = _file_url_to_path(str(direct_url.get("url", "")))
+    if installed_from is None:
+        raise RuntimeError(
+            "TensorFlow was not installed from a local file wheel. "
+            f"Expected: {expected_wheel}"
+        )
+
+    if installed_from != expected_wheel:
+        raise RuntimeError(
+            "TensorFlow wheel source mismatch. "
+            f"Installed from: {installed_from} | expected: {expected_wheel}"
+        )
+
+    _tf_source_checked = True
 
 
 def _configure_cuda_library_path() -> None:
@@ -113,6 +192,7 @@ def _warmup_gpu_kernels(feature_dim: int, quiet: bool, require_gpu: bool = False
         return False
 
     try:
+        _ensure_local_tensorflow_wheel()
         _configure_cuda_library_path()
         import tensorflow as tf
         from tensorflow import keras
@@ -160,6 +240,7 @@ def configure_gpu() -> str:
     Silently no-ops if TensorFlow or cuDNN is unavailable.
     """
     try:
+        _ensure_local_tensorflow_wheel()
         _configure_cuda_library_path()
         import tensorflow as tf
 
@@ -309,6 +390,7 @@ def train_model(
     _prepare_cuda_jit_cache()
     _configure_cuda_library_path()
     try:
+        _ensure_local_tensorflow_wheel()
         from tensorflow import keras
         from tensorflow.keras import layers  # type: ignore[attr-defined]
     except ImportError as exc:
@@ -318,6 +400,10 @@ def train_model(
         ) from exc
 
     device_info = _configure_gpu_once()
+    if _env_truthy("MODEL_REQUIRE_GPU", "false") and not device_info.startswith("GPU"):
+        raise RuntimeError(
+            "GPU required for model training but TensorFlow did not detect an active GPU device"
+        )
 
     X, y = build_training_data(
         bars, target_pct, max_horizon, short_window, long_window, rsi_window, momentum_lookback
@@ -447,6 +533,7 @@ def predict_entry(
     try:
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
         _prepare_cuda_jit_cache()
+        _ensure_local_tensorflow_wheel()
         _configure_cuda_library_path()
         import tensorflow as tf  # noqa: F401
     except ImportError:

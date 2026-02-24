@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -65,30 +66,101 @@ def fetch_recent_bars(cfg: Config, days: int) -> List[Dict[str, Any]]:
     return bars
 
 
+def analyze_bar_quality(bars: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not bars:
+        return {
+            "total_bars": 0,
+            "unique_close_count": 0,
+            "max_same_close_run": 0,
+            "same_close_adjacent_pairs": 0,
+        }
+
+    closes = [float(bar["c"]) for bar in bars]
+    unique_close_count = len(set(closes))
+
+    max_same_close_run = 1
+    current_run = 1
+    same_close_adjacent_pairs = 0
+    for i in range(1, len(closes)):
+        if closes[i] == closes[i - 1]:
+            current_run += 1
+            same_close_adjacent_pairs += 1
+            if current_run > max_same_close_run:
+                max_same_close_run = current_run
+        else:
+            current_run = 1
+
+    return {
+        "total_bars": len(bars),
+        "unique_close_count": unique_close_count,
+        "max_same_close_run": max_same_close_run,
+        "same_close_adjacent_pairs": same_close_adjacent_pairs,
+    }
+
+
 def run_backtest() -> None:
     cfg = load_config()
     days = int(get_config_value("BACKTEST_DAYS", "3"))
+    bars_file = get_config_value("BACKTEST_BARS_FILE", "").strip()
+    backtest_use_model = get_config_value("BACKTEST_USE_MODEL", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    backtest_skip_account_fetch = get_config_value("BACKTEST_SKIP_ACCOUNT_FETCH", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
     runtime_params_file = get_config_value("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
     runtime_params = load_runtime_params(runtime_params_file)
     if runtime_params:
         apply_runtime_params(cfg, runtime_params)
 
-    # Fetch actual account cash to use in backtest simulation
-    try:
-        api = AlpacaRest(cfg)
-        account_info = api.get_account()
-        starting_cash = float(account_info.get("cash", 0.0))
-        if starting_cash == 0.0:
-            print("Warning: Account cash is $0. Using configured starting_balance_usd.")
-            starting_cash = cfg.starting_balance_usd
-    except Exception as e:
-        print(f"Warning: Could not fetch account cash ({e}). Using configured starting_balance_usd.")
-        starting_cash = cfg.starting_balance_usd
+    api = AlpacaRest(cfg)
 
-    bars = fetch_recent_bars(cfg, days)
+    # Fetch actual account cash to use in backtest simulation
+    if backtest_skip_account_fetch:
+        starting_cash = cfg.starting_balance_usd
+    else:
+        try:
+            account_info = api.get_account()
+            starting_cash = float(account_info.get("cash", 0.0))
+            if starting_cash == 0.0:
+                print("Warning: Account cash is $0. Using configured starting_balance_usd.")
+                starting_cash = cfg.starting_balance_usd
+        except Exception as e:
+            print(f"Warning: Could not fetch account cash ({e}). Using configured starting_balance_usd.")
+            starting_cash = cfg.starting_balance_usd
+
+    bars: List[Dict[str, Any]]
+    if bars_file:
+        bars_path = Path(bars_file)
+        if not bars_path.exists():
+            raise FileNotFoundError(f"BACKTEST_BARS_FILE not found: {bars_path}")
+        payload = json.loads(bars_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("BACKTEST_BARS_FILE must contain a JSON array of bar objects")
+        bars = payload
+    else:
+        bars = fetch_recent_bars(cfg, days)
+
     if not bars:
         print("No bars returned for requested period. Check symbol and API credentials.")
         return
+
+    quality = analyze_bar_quality(bars)
+    max_stale_run_allowed = int(get_config_value("BACKTEST_MAX_STALE_RUN", "30"))
+    if quality["max_same_close_run"] >= max_stale_run_allowed:
+        raise RuntimeError(
+            "Backtest aborted due to stale data quality: "
+            f"max_same_close_run={int(quality['max_same_close_run'])} "
+            f">= BACKTEST_MAX_STALE_RUN={max_stale_run_allowed}"
+        )
 
     cash = starting_cash
     qty = 0.0
@@ -172,7 +244,7 @@ def run_backtest() -> None:
                 max_drawdown_pct = drawdown_pct
             continue
 
-        if should_enter(closes, cfg):
+        if should_enter(closes, cfg, use_model=backtest_use_model, emit_events=False):
             # Use actual available cash (98% for safety margin)
             notional = cash * 0.98
             if notional > 10:
@@ -245,6 +317,12 @@ def run_backtest() -> None:
     else:
         print("Runtime params applied: none (using .env defaults)")
     print(f"Bars: {len(bars)}")
+    print(
+        "Bar quality: "
+        f"unique_closes={int(quality['unique_close_count'])}, "
+        f"same_close_adjacent_pairs={int(quality['same_close_adjacent_pairs'])}, "
+        f"max_same_close_run={int(quality['max_same_close_run'])}"
+    )
     print(f"Starting cash (from account): ${starting_cash:,.2f}")
     print(f"Ending equity: ${equity:,.2f}")
     print(f"Realized PnL: ${realized_pnl:,.2f}")

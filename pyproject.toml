@@ -1,0 +1,29 @@
+[project]
+name = "tradebot"
+version = "0.1.0"
+description = "Extremely simple Alpaca crypto trading bot"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "requests>=2.32.0",
+  "python-dotenv>=1.0.1",
+  "tensorflow",
+  "numpy>=1.26.0",
+  "keras==3.13.2",
+  "nvidia-cublas-cu12==12.9.1.4; platform_system == 'Linux'",
+  "nvidia-cuda-cupti-cu12==12.9.79; platform_system == 'Linux'",
+  "nvidia-cuda-nvcc-cu12==12.9.86; platform_system == 'Linux'",
+  "nvidia-cuda-nvrtc-cu12==12.9.86; platform_system == 'Linux'",
+  "nvidia-cuda-runtime-cu12==12.9.79; platform_system == 'Linux'",
+  "nvidia-cudnn-cu12==9.19.0.56; platform_system == 'Linux'",
+  "nvidia-cufft-cu12==11.4.1.4; platform_system == 'Linux'",
+  "nvidia-curand-cu12==10.3.10.19; platform_system == 'Linux'",
+  "nvidia-cusolver-cu12==11.7.5.82; platform_system == 'Linux'",
+  "nvidia-cusparse-cu12==12.5.10.65; platform_system == 'Linux'",
+  "nvidia-nccl-cu12==2.29.3; platform_system == 'Linux'",
+  "nvidia-nvjitlink-cu12==12.9.86; platform_system == 'Linux'",
+  "tensorboard==2.20.0",
+]
+
+[tool.uv.sources]
+tensorflow = { path = ".wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl" }

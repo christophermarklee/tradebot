@@ -1,8 +1,9 @@
 import os
 import json
 import time
+import subprocess
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +59,16 @@ class Config:
     auto_sweep: bool
     sweep_refresh_minutes: int
     runtime_params_file: str
+    model_confidence_threshold: float
+    model_train_days: int
+    auto_model_retrain: bool
+    model_refresh_minutes: int
+    model_train_python: str
+    buy_fill_timeout_minutes: int
+    sell_fill_timeout_minutes: int
+    max_stale_polls: int
+    max_bar_age_seconds: int
+    stale_event_reset_after: int
 
 
 def get_env_float(name: str, default: float) -> float:
@@ -132,6 +143,16 @@ def load_config() -> Config:
             "RUNTIME_PARAMS_FILE",
             str(SRC_DIR / "runtime_params.json"),
         ),
+        model_confidence_threshold=get_env_float("MODEL_CONFIDENCE_THRESHOLD", 0.55),
+        model_train_days=get_env_int("MODEL_TRAIN_DAYS", 30),
+        auto_model_retrain=get_env_bool("AUTO_MODEL_RETRAIN", True),
+        model_refresh_minutes=get_env_int("MODEL_REFRESH_MINUTES", 240),
+        model_train_python=get_config_value("MODEL_TRAIN_PYTHON", ".venv/bin/python"),
+        buy_fill_timeout_minutes=get_env_int("BUY_FILL_TIMEOUT_MINUTES", 15),
+        sell_fill_timeout_minutes=get_env_int("SELL_FILL_TIMEOUT_MINUTES", 15),
+        max_stale_polls=get_env_int("MAX_STALE_POLLS", 4),
+        max_bar_age_seconds=get_env_int("MAX_BAR_AGE_SECONDS", 180),
+        stale_event_reset_after=get_env_int("STALE_EVENT_RESET_AFTER", 3),
     )
 
 
@@ -164,20 +185,53 @@ class AlpacaRest:
         response.raise_for_status()
         return response.json()
 
-    def get_closes(self, limit: int) -> List[float]:
+    def get_recent_bars(self, limit: int, end: Optional[datetime] = None) -> List[Dict[str, Any]]:
         url = f"{self.cfg.data_base_url}/v1beta3/crypto/us/bars"
         params = {
             "symbols": self.cfg.data_symbol,
             "timeframe": "1Min",
             "limit": limit,
+            "sort": "asc",
         }
+        if end is not None:
+            params["end"] = end.isoformat().replace("+00:00", "Z")
         response = requests.get(url, headers=self.data_headers, params=params, timeout=20)
         response.raise_for_status()
         data = response.json()
 
         bars_by_symbol = data.get("bars", {})
         bars = bars_by_symbol.get(self.cfg.data_symbol, [])
+        return bars
+
+    def get_closes(self, limit: int, end: Optional[datetime] = None) -> List[float]:
+        bars = self.get_recent_bars(limit=limit, end=end)
         return [float(bar["c"]) for bar in bars]
+
+    def get_historical_bars(self, days: int) -> List[Dict[str, Any]]:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        url = f"{self.cfg.data_base_url}/v1beta3/crypto/us/bars"
+        bars: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {
+                "symbols": self.cfg.data_symbol,
+                "timeframe": "1Min",
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "sort": "asc",
+                "limit": 1000,
+            }
+            if page_token:
+                params["page_token"] = page_token
+            response = requests.get(url, headers=self.data_headers, params=params, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            bars.extend(payload.get("bars", {}).get(self.cfg.data_symbol, []))
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+        return bars
 
     def submit_buy_notional(self, notional_usd: float) -> dict:
         url = f"{self.cfg.trade_base_url}/v2/orders"
@@ -204,6 +258,21 @@ class AlpacaRest:
         response = requests.post(url, headers=self.trade_headers, json=payload, timeout=20)
         response.raise_for_status()
         return response.json()
+
+    def get_order(self, order_id: str) -> Optional[dict]:
+        url = f"{self.cfg.trade_base_url}/v2/orders/{order_id}"
+        response = requests.get(url, headers=self.trade_headers, timeout=20)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    def cancel_order(self, order_id: str) -> None:
+        url = f"{self.cfg.trade_base_url}/v2/orders/{order_id}"
+        response = requests.delete(url, headers=self.trade_headers, timeout=20)
+        if response.status_code in (404, 422):
+            return
+        response.raise_for_status()
 
 
 def close_open_position(api: AlpacaRest) -> None:
@@ -246,15 +315,16 @@ def rsi(values: List[float], window: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def build_entry_signal(closes: List[float], cfg: Config) -> dict:
+def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True, emit_events: bool = True) -> dict:
     needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1)
     if len(closes) < needed:
-        emit(
-            "data_insufficient",
-            bars_received=len(closes),
-            bars_needed=needed,
-            message=f"Need {needed} bars, got {len(closes)}",
-        )
+        if emit_events:
+            emit(
+                "data_insufficient",
+                bars_received=len(closes),
+                bars_needed=needed,
+                message=f"Need {needed} bars, got {len(closes)}",
+            )
         return {
             "enter": False,
             "enough_data": False,
@@ -265,6 +335,9 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
             "rsi_ok": False,
             "momentum_pct": None,
             "momentum_ok": False,
+            "model_probability": None,
+            "model_used": False,
+            "model_skip_reason": f"insufficient_rule_bars_need_{needed}_got_{len(closes)}",
         }
 
     short_sma = sma(closes, cfg.short_window)
@@ -282,7 +355,43 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
     momentum_pct = ((closes[-1] / momentum_base) - 1.0) * 100.0
     momentum_ok = momentum_pct >= cfg.min_momentum_pct
 
-    enter = trend_ok and rsi_ok and momentum_ok
+    rules_enter = trend_ok and rsi_ok and momentum_ok
+
+    # Try model prediction — returns None when model is unavailable (graceful fallback)
+    model_prob: Optional[float] = None
+    model_skip_reason: Optional[str] = None
+    if use_model:
+        try:
+            try:
+                import model as _model_module
+            except ModuleNotFoundError:
+                from src import model as _model_module  # type: ignore[no-redef]
+            model_feature_window = int(getattr(_model_module, "FEATURE_WINDOW", 50))
+            model_needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1, model_feature_window)
+            if len(closes) < model_needed:
+                model_skip_reason = f"insufficient_model_bars_need_{model_needed}_got_{len(closes)}"
+            else:
+                model_prob = _model_module.predict_entry(
+                    closes,
+                    short_window=cfg.short_window,
+                    long_window=cfg.long_window,
+                    rsi_window=cfg.rsi_window,
+                    momentum_lookback=cfg.momentum_lookback,
+                )
+                if model_prob is None:
+                    model_skip_reason = "predict_entry_returned_none"
+        except Exception as err:
+            model_prob = None
+            model_skip_reason = f"predict_entry_exception_{type(err).__name__}"
+    else:
+        model_skip_reason = "model_disabled"
+
+    enter = (
+        model_prob >= cfg.model_confidence_threshold
+        if model_prob is not None
+        else rules_enter
+    )
+
     return {
         "enter": enter,
         "enough_data": True,
@@ -293,11 +402,14 @@ def build_entry_signal(closes: List[float], cfg: Config) -> dict:
         "rsi_ok": rsi_ok,
         "momentum_pct": momentum_pct,
         "momentum_ok": momentum_ok,
+        "model_probability": model_prob,
+        "model_used": model_prob is not None,
+        "model_skip_reason": model_skip_reason,
     }
 
 
-def should_enter(closes: List[float], cfg: Config) -> bool:
-    return bool(build_entry_signal(closes, cfg)["enter"])
+def should_enter(closes: List[float], cfg: Config, use_model: bool = True, emit_events: bool = True) -> bool:
+    return bool(build_entry_signal(closes, cfg, use_model=use_model, emit_events=emit_events)["enter"])
 
 
 def append_trade_log(
@@ -382,6 +494,71 @@ def apply_runtime_params(cfg: Config, params: Dict[str, Any]) -> None:
                 continue
 
 
+def _maybe_retrain_model(cfg: Config) -> None:
+    """Retrain TF entry model via dedicated ML Python interpreter."""
+    try:
+        train_python = cfg.model_train_python.strip()
+        if not train_python:
+            emit("model_train_skip", reason="empty_model_train_python")
+            return
+
+        train_python_path = Path(train_python)
+        if train_python_path.is_absolute():
+            python_cmd = train_python_path
+        else:
+            python_cmd = SRC_DIR.parent / train_python_path
+
+        if not python_cmd.exists():
+            emit(
+                "model_train_skip",
+                reason="model_train_python_not_found",
+                model_train_python=str(python_cmd),
+            )
+            return
+
+        command = [str(python_cmd), str(SRC_DIR / "model.py"), "--days", str(cfg.model_train_days)]
+        if cfg.sweep_quiet:
+            command.append("--quiet")
+
+        emit(
+            "model_train_start",
+            days=cfg.model_train_days,
+            model_train_python=str(python_cmd),
+        )
+
+        result = subprocess.run(
+            command,
+            cwd=str(SRC_DIR.parent),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            if not message:
+                message = f"trainer exited with code {result.returncode}"
+            emit("error", message=f"Model training failed: {message}")
+            return
+
+        model_path = SRC_DIR / "model.keras"
+        emit(
+            "model_train_complete",
+            model_path=str(model_path),
+            model_exists=model_path.exists(),
+            model_mtime_utc=(
+                datetime.fromtimestamp(model_path.stat().st_mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+                if model_path.exists()
+                else None
+            ),
+        )
+    except Exception as err:
+        emit("error", message=f"Model training failed: {err}")
+
+
 def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
     if not cfg.auto_sweep:
         return
@@ -421,6 +598,27 @@ def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
         emit("error", message=f"Auto sweep failed: {err}")
 
 
+def maybe_refresh_model(cfg: Config, now_ts: float) -> None:
+    if not cfg.auto_model_retrain:
+        return
+
+    model_path = SRC_DIR / "model.keras"
+    refresh_seconds = max(cfg.model_refresh_minutes, 1) * 60
+    if model_path.exists():
+        age_seconds = now_ts - model_path.stat().st_mtime
+        if age_seconds < refresh_seconds:
+            return
+
+    emit(
+        "decision",
+        action="auto_model_retrain_start",
+        model_path=str(model_path),
+        model_refresh_minutes=cfg.model_refresh_minutes,
+        model_train_days=cfg.model_train_days,
+    )
+    _maybe_retrain_model(cfg)
+
+
 def run() -> None:
     cfg = load_config()
     api = AlpacaRest(cfg)
@@ -430,6 +628,11 @@ def run() -> None:
     position_opened_at: Optional[float] = None
     cooldown_until: float = 0.0
     runtime_signature = ""
+    last_seen_bar_ts: Optional[datetime] = None
+    stale_poll_count = 0
+    stale_event_count = 0
+    in_flight_order_id: Optional[str] = None
+    in_flight_submitted_at: Optional[float] = None
 
     # Fetch actual account cash at startup
     try:
@@ -451,15 +654,23 @@ def run() -> None:
         take_profit_buffer_usd=cfg.take_profit_buffer_usd,
         max_hold_minutes=cfg.max_hold_minutes,
         cooldown_minutes=cfg.cooldown_minutes,
+        bar_limit=cfg.bar_limit,
         rsi_window=cfg.rsi_window,
         rsi_min=cfg.rsi_min,
         rsi_max=cfg.rsi_max,
         momentum_lookback=cfg.momentum_lookback,
         min_momentum_pct=cfg.min_momentum_pct,
+        max_stale_polls=cfg.max_stale_polls,
+        max_bar_age_seconds=cfg.max_bar_age_seconds,
+        stale_event_reset_after=cfg.stale_event_reset_after,
         trade_log_file=cfg.trade_log_file,
         auto_sweep=cfg.auto_sweep,
         sweep_refresh_minutes=cfg.sweep_refresh_minutes,
         runtime_params_file=cfg.runtime_params_file,
+        auto_model_retrain=cfg.auto_model_retrain,
+        model_refresh_minutes=cfg.model_refresh_minutes,
+        model_train_python=cfg.model_train_python,
+        model_min_bars_required=max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1, 50),
     )
 
     # Warmup period: wait for sufficient historical data
@@ -489,6 +700,7 @@ def run() -> None:
             try:
                 now_ts = time.time()
                 maybe_refresh_runtime_params(cfg, now_ts)
+                maybe_refresh_model(cfg, now_ts)
 
                 runtime_params = load_runtime_params(cfg.runtime_params_file)
                 if runtime_params:
@@ -511,19 +723,118 @@ def run() -> None:
 
                 if in_flight_side == "buy":
                     if position is None:
-                        emit("decision", action="wait_buy_fill")
+                        order_status = "unknown"
+                        if in_flight_order_id:
+                            order_data = api.get_order(in_flight_order_id)
+                            if order_data is not None:
+                                order_status = str(order_data.get("status", "unknown")).lower()
+                            else:
+                                order_status = "missing"
+
+                        buy_timeout_seconds = max(cfg.buy_fill_timeout_minutes, 1) * 60
+                        buy_fill_wait_seconds = (
+                            int(now_ts - in_flight_submitted_at)
+                            if in_flight_submitted_at is not None
+                            else 0
+                        )
+
+                        if order_status in {"canceled", "rejected", "expired", "suspended", "missing"}:
+                            emit(
+                                "error",
+                                message=(
+                                    "Buy order did not fill and is no longer active "
+                                    f"(status={order_status}); resetting in-flight state"
+                                ),
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        if buy_fill_wait_seconds >= buy_timeout_seconds:
+                            if in_flight_order_id:
+                                try:
+                                    api.cancel_order(in_flight_order_id)
+                                except Exception as cancel_err:
+                                    emit("error", message=f"Failed to cancel stale buy order: {cancel_err}")
+                            emit(
+                                "decision",
+                                action="buy_fill_timeout_reset",
+                                wait_seconds=buy_fill_wait_seconds,
+                                timeout_seconds=buy_timeout_seconds,
+                                order_status=order_status,
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        emit(
+                            "decision",
+                            action="wait_buy_fill",
+                            wait_seconds=buy_fill_wait_seconds,
+                            timeout_seconds=buy_timeout_seconds,
+                            order_status=order_status,
+                        )
                         time.sleep(cfg.poll_seconds)
                         continue
                     in_flight_side = None
+                    in_flight_order_id = None
+                    in_flight_submitted_at = None
                     position_opened_at = now_ts
                     emit("decision", action="buy_filled")
 
                 if in_flight_side == "sell":
                     if position is not None:
-                        emit("decision", action="wait_sell_fill")
+                        order_status = "unknown"
+                        if in_flight_order_id:
+                            order_data = api.get_order(in_flight_order_id)
+                            if order_data is not None:
+                                order_status = str(order_data.get("status", "unknown")).lower()
+                            else:
+                                order_status = "missing"
+
+                        sell_timeout_seconds = max(cfg.sell_fill_timeout_minutes, 1) * 60
+                        sell_fill_wait_seconds = (
+                            int(now_ts - in_flight_submitted_at)
+                            if in_flight_submitted_at is not None
+                            else 0
+                        )
+
+                        if sell_fill_wait_seconds >= sell_timeout_seconds:
+                            if in_flight_order_id:
+                                try:
+                                    api.cancel_order(in_flight_order_id)
+                                except Exception as cancel_err:
+                                    emit("error", message=f"Failed to cancel stale sell order: {cancel_err}")
+                            emit(
+                                "decision",
+                                action="sell_fill_timeout_reset",
+                                wait_seconds=sell_fill_wait_seconds,
+                                timeout_seconds=sell_timeout_seconds,
+                                order_status=order_status,
+                            )
+                            in_flight_side = None
+                            in_flight_order_id = None
+                            in_flight_submitted_at = None
+                            cooldown_until = now_ts + (cfg.cooldown_minutes * 60)
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        emit(
+                            "decision",
+                            action="wait_sell_fill",
+                            wait_seconds=sell_fill_wait_seconds,
+                            timeout_seconds=sell_timeout_seconds,
+                            order_status=order_status,
+                        )
                         time.sleep(cfg.poll_seconds)
                         continue
                     in_flight_side = None
+                    in_flight_order_id = None
+                    in_flight_submitted_at = None
                     cooldown_until = now_ts + (cfg.cooldown_minutes * 60)
                     position_opened_at = None
                     emit("decision", action="sell_filled_cooldown_started")
@@ -558,8 +869,10 @@ def run() -> None:
                         exit_reason = "max_hold"
 
                     if exit_reason:
-                        api.submit_sell_qty(qty)
+                        sell_order = api.submit_sell_qty(qty)
                         in_flight_side = "sell"
+                        in_flight_order_id = str(sell_order.get("id", "")) or None
+                        in_flight_submitted_at = now_ts
                         append_trade_log(
                             cfg=cfg,
                             side="sell",
@@ -585,9 +898,56 @@ def run() -> None:
                         time.sleep(cfg.poll_seconds)
                         continue
 
-                    closes = api.get_closes(cfg.bar_limit)
-                    if len(closes) == 0:
+                    bars = api.get_recent_bars(
+                        limit=cfg.bar_limit,
+                        end=datetime.now(timezone.utc),
+                    )
+                    if len(bars) == 0:
                         emit("error", message="No bars received from API")
+                        time.sleep(cfg.poll_seconds)
+                        continue
+
+                    closes = [float(bar["c"]) for bar in bars]
+                    latest_bar_ts = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00"))
+                    bar_age_seconds = int((datetime.now(timezone.utc) - latest_bar_ts).total_seconds())
+
+                    stale_reasons: List[str] = []
+                    if last_seen_bar_ts is not None and latest_bar_ts <= last_seen_bar_ts:
+                        stale_poll_count += 1
+                        stale_reasons.append("latest_bar_not_advanced")
+                    else:
+                        stale_poll_count = 0
+                        last_seen_bar_ts = latest_bar_ts
+
+                    if bar_age_seconds > cfg.max_bar_age_seconds:
+                        stale_reasons.append("latest_bar_too_old")
+
+                    if stale_reasons and stale_poll_count >= cfg.max_stale_polls:
+                        stale_event_count += 1
+                        emit(
+                            "market_data_stale",
+                            reasons=stale_reasons,
+                            stale_poll_count=stale_poll_count,
+                            stale_event_count=stale_event_count,
+                            latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
+                            bar_age_seconds=bar_age_seconds,
+                            max_stale_polls=cfg.max_stale_polls,
+                            max_bar_age_seconds=cfg.max_bar_age_seconds,
+                            stale_event_reset_after=cfg.stale_event_reset_after,
+                        )
+
+                        if stale_event_count >= max(cfg.stale_event_reset_after, 1):
+                            api = AlpacaRest(cfg)
+                            last_seen_bar_ts = None
+                            stale_poll_count = 0
+                            stale_event_count = 0
+                            emit(
+                                "data_client_reset",
+                                reason="stale_market_data_threshold",
+                                action="recreate_alpaca_client",
+                            )
+
+                        emit("decision", action="wait_stale_market_data")
                         time.sleep(cfg.poll_seconds)
                         continue
                     
@@ -605,6 +965,12 @@ def run() -> None:
                         momentum_pct=round(signal["momentum_pct"], 4) if signal["momentum_pct"] is not None else None,
                         momentum_ok=signal["momentum_ok"],
                         enough_data=signal["enough_data"],
+                        model_probability=round(signal["model_probability"], 4) if signal.get("model_probability") is not None else None,
+                        model_used=signal.get("model_used", False),
+                        model_skip_reason=signal.get("model_skip_reason"),
+                        latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
+                        bar_age_seconds=bar_age_seconds,
+                        stale_poll_count=stale_poll_count,
                         signal_enter=enter_now,
                     )
 
@@ -615,7 +981,7 @@ def run() -> None:
                         order_notional = cash * 0.98
 
                         if order_notional > 10:
-                            api.submit_buy_notional(order_notional)
+                            buy_order = api.submit_buy_notional(order_notional)
                             entry_price = closes[-1]
                             approx_qty = order_notional / entry_price
                             append_trade_log(
@@ -627,6 +993,8 @@ def run() -> None:
                                 reason="signal",
                             )
                             in_flight_side = "buy"
+                            in_flight_order_id = str(buy_order.get("id", "")) or None
+                            in_flight_submitted_at = now_ts
                             emit(
                                 "decision",
                                 action="submit_buy",
@@ -634,6 +1002,7 @@ def run() -> None:
                                 approx_qty=round(approx_qty, 8),
                                 entry_price=round(entry_price, 2),
                                 cash=round(cash, 2),
+                                order_id=in_flight_order_id,
                             )
                         else:
                             emit(
@@ -650,13 +1019,24 @@ def run() -> None:
 
             time.sleep(cfg.poll_seconds)
     except KeyboardInterrupt:
-        emit("shutdown", action="keyboard_interrupt_close_position")
+        try:
+            emit("shutdown", action="keyboard_interrupt_close_position")
+        except KeyboardInterrupt:
+            pass
         try:
             close_open_position(api)
             in_flight_side = None
+        except KeyboardInterrupt:
+            pass
         except Exception as err:
-            emit("error", message=f"Failed to close position on shutdown: {err}")
-        emit("shutdown", action="exit_clean")
+            try:
+                emit("error", message=f"Failed to close position on shutdown: {err}")
+            except KeyboardInterrupt:
+                pass
+        try:
+            emit("shutdown", action="exit_clean")
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

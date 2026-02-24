@@ -12,17 +12,88 @@ The bot automatically uses your actual Alpaca account cash balance (98% for safe
 - Computes short SMA (9) and long SMA (26)
 - Uses RSI and short-term momentum as additional entry filters
 - Buys when trend + RSI + momentum all agree
+- Detects stale/frozen market data and pauses entries until feed resumes
 - Exits on take-profit, stop-loss, or max hold time
 - Then waits for the next setup
 
 ## 1) Setup
 
-1. Create a Python virtual environment and activate it.
-2. Install dependencies:
+1. Install `uv` if needed:
    ```bash
-   pip install -r requirements.txt
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
-3. Copy `.env.example` to `.env` and add your Alpaca API credentials:
+2. Create a Python virtual environment and activate it:
+   ```bash
+   uv venv
+   source .venv/bin/activate
+   ```
+3. Install dependencies:
+   ```bash
+   uv sync
+   ```
+   This project is pinned to Python 3.13 and includes TensorFlow in the main environment.
+
+### Linux CUDA / GPU checklist (TensorFlow pip)
+
+For GPU acceleration, verify NVIDIA driver visibility first:
+
+```bash
+nvidia-smi
+```
+
+Then verify TensorFlow sees your GPU:
+
+```bash
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+If no GPU is listed, follow TensorFlow's Linux pip guidance to ensure CUDA components are correctly available in the environment.
+
+Then train and save the model file used by bot inference:
+
+```bash
+python src/model.py
+```
+
+This writes `src/model.keras`.
+
+When running `src/bot.py`, the bot can also retrain this model periodically using:
+- `AUTO_MODEL_RETRAIN=true`
+- `MODEL_REFRESH_MINUTES=240`
+- `MODEL_TRAIN_PYTHON=.venv/bin/python`
+
+If `src/model.keras` is missing or older than `MODEL_REFRESH_MINUTES`, bot auto-triggers retraining.
+
+### RTX 5090: build TensorFlow from source (sm_120)
+
+If prebuilt TensorFlow wheels do not run reliably on compute capability `12.0`, build a local wheel targeting `sm_120`:
+
+```bash
+scripts/build_tensorflow_sm120.sh
+```
+
+This script will:
+- sync deps with `uv`
+- clone/update TensorFlow source in `.tensorflow-src/`
+- configure CUDA build with `TF_CUDA_COMPUTE_CAPABILITIES=12.0`
+- build a wheel via `bazelisk`
+- stage the wheel at `.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl`
+- install that staged local wheel into `.venv`
+
+`pyproject.toml` is pinned so `uv` resolves `tensorflow` from `.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl` only.
+
+Useful overrides:
+
+```bash
+TF_REF=master CUDA_CC=12.0 JOBS=32 scripts/build_tensorflow_sm120.sh
+```
+
+After install, verify GPU visibility:
+
+```bash
+uv run --python 3.13 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
+```
+4. Copy `.env.example` to `.env` and add your Alpaca API credentials:
    ```
    APCA_API_KEY_ID=your_key_here
    APCA_API_SECRET_KEY=your_secret_here
@@ -32,6 +103,58 @@ The bot automatically uses your actual Alpaca account cash balance (98% for safe
 
 ```bash
 python src/bot.py
+```
+
+## Production session (12-hour run)
+
+Run a bounded production session with one command:
+
+```bash
+uv run scripts/run_production_session.sh
+```
+
+Defaults:
+- `DURATION_HOURS=12`
+- `SESSION_TAG=gpuprod`
+- `PREPARE_MODEL=true` (trains a fresh model at startup)
+- `PREPARE_MODEL_STRICT=true` (aborts startup if a fresh model is not produced)
+- hard timeout with graceful kill window
+- periodic retraining enabled: `AUTO_MODEL_RETRAIN=true`
+- periodic retraining uses GPU by default: `MODEL_REQUIRE_GPU=true`
+- retraining interpreter pinned to production interpreter (`MODEL_TRAIN_PYTHON` defaults to `PYTHON_BIN`)
+- startup prep falls back to direct retrain with GPU required (GPU warmup disabled) if warmup path fails
+- local TensorFlow wheel is required: `MODEL_LOCAL_TF_WHEEL_PATH=.wheels/tensorflow-2.22.0.dev0+selfbuilt-cp313-cp313-linux_x86_64.whl`
+
+Run with `uv` (recommended):
+
+```bash
+uv run scripts/run_production_session.sh
+```
+
+Press `Ctrl-C` to stop early; the script traps the interrupt, stops child processes, and exits with status `130`.
+
+Useful overrides:
+
+```bash
+DURATION_HOURS=12 PREPARE_MODEL=true PREPARE_MODEL_STRICT=false MODEL_DAYS=7 SESSION_TAG=prod uv run scripts/run_production_session.sh
+```
+
+Tune periodic retraining cadence for long sessions:
+
+```bash
+DURATION_HOURS=12 MODEL_REFRESH_MINUTES=180 MODEL_TRAIN_DAYS=7 SESSION_TAG=prod uv run scripts/run_production_session.sh
+```
+
+After completion, the script writes:
+- `logs/<session>_bot.log` (raw session output)
+- `logs/<session>_summary.json` (event/action/error summary)
+- `logs/<session>.status` (bot exit code; `124` means timeout reached cleanly)
+- `logs/<session>.meta.json` (session metadata)
+
+You can re-run summary manually for any session log:
+
+```bash
+python scripts/review_bot_session.py --log logs/<session>_bot.log --exit-code 124
 ```
 
 ## Config
@@ -49,6 +172,12 @@ All bot behavior settings are stored here. You can edit this file to change defa
 - `BAR_LIMIT`: Number of historical bars to fetch
 - `RSI_WINDOW`, `RSI_MIN`, `RSI_MAX`: RSI indicator settings
 - `MOMENTUM_LOOKBACK`, `MIN_MOMENTUM_PCT`: Momentum filter settings
+- `MAX_STALE_POLLS`: Number of consecutive stale polls before entry is paused
+- `MAX_BAR_AGE_SECONDS`: Max allowed age for latest bar before feed is treated as stale
+- `STALE_EVENT_RESET_AFTER`: Number of stale-data events before bot recreates Alpaca client automatically
+- `BUY_FILL_TIMEOUT_MINUTES`: Max minutes to wait for a buy fill before cancel/reset (default `15`)
+- `SELL_FILL_TIMEOUT_MINUTES`: Max minutes to wait for a sell fill before cancel/reset (default `15`)
+- `BACKTEST_MAX_STALE_RUN`: Abort backtest if too many consecutive identical closes are seen
 - And more...
 
 **Note:** The bot automatically uses your actual Alpaca account cash balance. It will invest 98% of available cash per trade for safety.
@@ -75,6 +204,18 @@ python tests/backtest.py
 
 It force-closes any open position on the last bar so results are fully realized.
 Set `BACKTEST_DAYS` in `.env` to change the window.
+Backtest now aborts early on stale/frozen data runs to avoid tuning on bad inputs.
+By default, backtest uses rule-based signals only for speed (`BACKTEST_USE_MODEL=false`). Set `BACKTEST_USE_MODEL=true` to include model inference.
+
+## Diagnose feed vs market data
+
+Compare bot log market_data rows with actual Alpaca bars for the same UTC window:
+
+```bash
+python scripts/diagnose_data_feed.py --log logs/bot_20260223_010150_utc.log --start 2026-02-23T01:01:00Z --end 2026-02-23T06:41:00Z
+```
+
+This prints JSON with unique-close counts and max repeated-close run lengths for both sources.
 
 ## Sweep (auto-tune simple signals)
 

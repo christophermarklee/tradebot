@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 360
     env:
       CHUNK_MINUTES: "340"
-      PYTHON_BIN: python3
+      PYTHON_BIN: .venv/bin/python
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
@@ -28,12 +28,14 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          uv sync
 
       - name: Write .env from secrets
         shell: bash
@@ -70,8 +72,8 @@ jobs:
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-          git add src/runtime_params.json
-          git commit -m "Update runtime_params.json [skip ci]" || echo "No changes to commit"
+          git add src/runtime_params.json src/model.keras
+          git commit -m "Update runtime_params.json and model.keras [skip ci]" || echo "No changes to commit"
           git push
 
       - name: Re-dispatch workflow

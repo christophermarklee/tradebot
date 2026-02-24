@@ -147,15 +147,9 @@ DURATION_HOURS=12 MODEL_REFRESH_MINUTES=180 MODEL_TRAIN_DAYS=7 SESSION_TAG=prod 
 
 After completion, the script writes:
 - `logs/<session>_bot.log` (raw session output)
-- `logs/<session>_summary.json` (event/action/error summary)
+- `logs/<session>_summary.json` (exit summary)
 - `logs/<session>.status` (bot exit code; `124` means timeout reached cleanly)
 - `logs/<session>.meta.json` (session metadata)
-
-You can re-run summary manually for any session log:
-
-```bash
-python scripts/review_bot_session.py --log logs/<session>_bot.log --exit-code 124
-```
 
 ## Config
 
@@ -188,8 +182,6 @@ Only API credentials belong here:
 - `APCA_API_SECRET_KEY`: Your Alpaca API secret
 
 **Note:** Any setting from `src/env.json` can be overridden by setting it in `.env` or as an environment variable.
-- `SWEEP_REFRESH_MINUTES=240`
-- `RUNTIME_PARAMS_FILE=src/runtime_params.json`
 - `TRADE_SYMBOL=BTCUSD`
 - `DATA_SYMBOL=BTC/USD`
 - `POLL_SECONDS=20`
@@ -206,33 +198,6 @@ It force-closes any open position on the last bar so results are fully realized.
 Set `BACKTEST_DAYS` in `.env` to change the window.
 Backtest now aborts early on stale/frozen data runs to avoid tuning on bad inputs.
 By default, backtest uses rule-based signals only for speed (`BACKTEST_USE_MODEL=false`). Set `BACKTEST_USE_MODEL=true` to include model inference.
-
-## Diagnose feed vs market data
-
-Compare bot log market_data rows with actual Alpaca bars for the same UTC window:
-
-```bash
-python scripts/diagnose_data_feed.py --log logs/bot_20260223_010150_utc.log --start 2026-02-23T01:01:00Z --end 2026-02-23T06:41:00Z
-```
-
-This prints JSON with unique-close counts and max repeated-close run lengths for both sources.
-
-## Sweep (auto-tune simple signals)
-
-Run a small grid search over RSI/momentum/hold settings:
-
-```bash
-python src/sweeps.py
-```
-
-It uses `BACKTEST_DAYS` (default `3`) and ranks by a combined score:
-- higher ending equity
-- more closed trades
-- lower max drawdown
-
-It writes the best parameters to `src/runtime_params.json`.
-
-`bot.py` auto-runs sweeps when `AUTO_SWEEP=true` and `src/runtime_params.json` is missing/stale, then reloads and applies those params each loop.
 
 ## Notes
 - Start on **paper trading** first.

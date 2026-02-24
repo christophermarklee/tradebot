@@ -55,11 +55,12 @@ class Config:
     trade_log_file: str
     log_pretty: bool
     backtest_days: int
-    sweep_quiet: bool
-    auto_sweep: bool
-    sweep_refresh_minutes: int
-    runtime_params_file: str
     model_confidence_threshold: float
+    model_trend_slope_min: float
+    model_high_volatility_threshold: float
+    model_high_volatility_threshold_boost: float
+    model_extreme_confidence_threshold: float
+    model_drift_zscore_limit: float
     model_train_days: int
     auto_model_retrain: bool
     model_refresh_minutes: int
@@ -136,14 +137,12 @@ def load_config() -> Config:
         trade_log_file=get_config_value("TRADE_LOG_FILE", "trade_log.csv"),
         log_pretty=get_env_bool("LOG_PRETTY", False),
         backtest_days=get_env_int("BACKTEST_DAYS", 3),
-        sweep_quiet=get_env_bool("SWEEP_QUIET", True),
-        auto_sweep=get_env_bool("AUTO_SWEEP", True),
-        sweep_refresh_minutes=get_env_int("SWEEP_REFRESH_MINUTES", 240),
-        runtime_params_file=get_config_value(
-            "RUNTIME_PARAMS_FILE",
-            str(SRC_DIR / "runtime_params.json"),
-        ),
         model_confidence_threshold=get_env_float("MODEL_CONFIDENCE_THRESHOLD", 0.55),
+        model_trend_slope_min=get_env_float("MODEL_TREND_SLOPE_MIN", 0.0002),
+        model_high_volatility_threshold=get_env_float("MODEL_HIGH_VOLATILITY_THRESHOLD", 0.004),
+        model_high_volatility_threshold_boost=get_env_float("MODEL_HIGH_VOLATILITY_THRESHOLD_BOOST", 0.05),
+        model_extreme_confidence_threshold=get_env_float("MODEL_EXTREME_CONFIDENCE_THRESHOLD", 0.80),
+        model_drift_zscore_limit=get_env_float("MODEL_DRIFT_ZSCORE_LIMIT", 3.0),
         model_train_days=get_env_int("MODEL_TRAIN_DAYS", 30),
         auto_model_retrain=get_env_bool("AUTO_MODEL_RETRAIN", True),
         model_refresh_minutes=get_env_int("MODEL_REFRESH_MINUTES", 240),
@@ -191,7 +190,7 @@ class AlpacaRest:
             "symbols": self.cfg.data_symbol,
             "timeframe": "1Min",
             "limit": limit,
-            "sort": "asc",
+            "sort": "desc",
         }
         if end is not None:
             params["end"] = end.isoformat().replace("+00:00", "Z")
@@ -201,6 +200,7 @@ class AlpacaRest:
 
         bars_by_symbol = data.get("bars", {})
         bars = bars_by_symbol.get(self.cfg.data_symbol, [])
+        bars.reverse()
         return bars
 
     def get_closes(self, limit: int, end: Optional[datetime] = None) -> List[float]:
@@ -315,8 +315,65 @@ def rsi(values: List[float], window: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def _calc_return(closes: List[float], lookback: int) -> float:
+    if len(closes) <= lookback:
+        return 0.0
+    return (closes[-1] / closes[-1 - lookback]) - 1.0
+
+
+def _calc_ema(values: List[float], window: int) -> float:
+    if not values:
+        return 0.0
+    alpha = 2.0 / (window + 1.0)
+    ema_val = values[0]
+    for value in values[1:]:
+        ema_val = alpha * value + (1.0 - alpha) * ema_val
+    return ema_val
+
+
+def _trend_regime(closes: List[float]) -> Dict[str, float | str]:
+    ret_5m = _calc_return(closes, 5)
+    ret_15m = _calc_return(closes, 15)
+    ret_60m = _calc_return(closes, 60)
+    ema20 = _calc_ema(closes[-120:], 20)
+    ema60 = _calc_ema(closes[-180:], 60)
+    slope_ratio = (ema20 / max(ema60, 1e-9)) - 1.0
+    tail = closes[-21:] if len(closes) >= 21 else closes
+    rets = [tail[i] / tail[i - 1] - 1.0 for i in range(1, len(tail))]
+    volatility = float(sum((r - (sum(rets) / max(len(rets), 1))) ** 2 for r in rets) / max(len(rets), 1)) ** 0.5 if rets else 0.0
+
+    if ret_15m > 0 and slope_ratio > 0:
+        regime = "bull"
+    elif ret_15m < 0 and slope_ratio < 0:
+        regime = "bear"
+    else:
+        regime = "chop"
+
+    return {
+        "ret_5m": ret_5m,
+        "ret_15m": ret_15m,
+        "ret_60m": ret_60m,
+        "ema_slope_ratio": slope_ratio,
+        "volatility": volatility,
+        "regime": regime,
+    }
+
+
+def _dynamic_model_threshold(cfg: Config, trend: Dict[str, float | str]) -> float:
+    threshold = cfg.model_confidence_threshold
+    volatility = float(trend["volatility"])
+    regime = str(trend["regime"])
+    if volatility >= cfg.model_high_volatility_threshold:
+        threshold += cfg.model_high_volatility_threshold_boost
+    if regime == "bull":
+        threshold -= 0.02
+    elif regime == "bear":
+        threshold += 0.03
+    return max(0.05, min(0.98, threshold))
+
+
 def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True, emit_events: bool = True) -> dict:
-    needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1)
+    needed = max(cfg.long_window, cfg.rsi_window + 1, cfg.momentum_lookback + 1, 61)
     if len(closes) < needed:
         if emit_events:
             emit(
@@ -338,6 +395,11 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
             "model_probability": None,
             "model_used": False,
             "model_skip_reason": f"insufficient_rule_bars_need_{needed}_got_{len(closes)}",
+            "dynamic_threshold": cfg.model_confidence_threshold,
+            "trend_regime": "unknown",
+            "trend_slope_15m": 0.0,
+            "trend_volatility": 0.0,
+            "drift_zscore": None,
         }
 
     short_sma = sma(closes, cfg.short_window)
@@ -356,10 +418,13 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
     momentum_ok = momentum_pct >= cfg.min_momentum_pct
 
     rules_enter = trend_ok and rsi_ok and momentum_ok
+    trend = _trend_regime(closes)
+    dynamic_threshold = _dynamic_model_threshold(cfg, trend)
 
     # Try model prediction — returns None when model is unavailable (graceful fallback)
     model_prob: Optional[float] = None
     model_skip_reason: Optional[str] = None
+    drift_zscore: Optional[float] = None
     if use_model:
         try:
             try:
@@ -371,14 +436,30 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
             if len(closes) < model_needed:
                 model_skip_reason = f"insufficient_model_bars_need_{model_needed}_got_{len(closes)}"
             else:
-                model_prob = _model_module.predict_entry(
-                    closes,
-                    short_window=cfg.short_window,
-                    long_window=cfg.long_window,
-                    rsi_window=cfg.rsi_window,
-                    momentum_lookback=cfg.momentum_lookback,
-                )
-                if model_prob is None:
+                if hasattr(_model_module, "predict_entry_with_diagnostics"):
+                    diagnostics = _model_module.predict_entry_with_diagnostics(
+                        closes,
+                        short_window=cfg.short_window,
+                        long_window=cfg.long_window,
+                        rsi_window=cfg.rsi_window,
+                        momentum_lookback=cfg.momentum_lookback,
+                    )
+                    raw_prob = diagnostics.get("probability")
+                    model_prob = float(raw_prob) if isinstance(raw_prob, (float, int)) else None
+                    raw_drift = diagnostics.get("drift_zscore")
+                    drift_zscore = float(raw_drift) if isinstance(raw_drift, (float, int)) else None
+                    raw_reason = diagnostics.get("reason")
+                    if isinstance(raw_reason, str) and raw_reason != "ok":
+                        model_skip_reason = raw_reason
+                else:
+                    model_prob = _model_module.predict_entry(
+                        closes,
+                        short_window=cfg.short_window,
+                        long_window=cfg.long_window,
+                        rsi_window=cfg.rsi_window,
+                        momentum_lookback=cfg.momentum_lookback,
+                    )
+                if model_prob is None and model_skip_reason is None:
                     model_skip_reason = "predict_entry_returned_none"
         except Exception as err:
             model_prob = None
@@ -386,11 +467,18 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
     else:
         model_skip_reason = "model_disabled"
 
-    enter = (
-        model_prob >= cfg.model_confidence_threshold
-        if model_prob is not None
-        else rules_enter
-    )
+    if drift_zscore is not None and drift_zscore > cfg.model_drift_zscore_limit:
+        model_prob = None
+        model_skip_reason = f"drift_zscore_{drift_zscore:.2f}_gt_{cfg.model_drift_zscore_limit:.2f}"
+
+    if model_prob is not None:
+        regime = str(trend["regime"])
+        slope_15m = float(trend["ret_15m"])
+        regime_ok = regime != "bear" or model_prob >= cfg.model_extreme_confidence_threshold
+        slope_ok = slope_15m >= cfg.model_trend_slope_min or model_prob >= cfg.model_extreme_confidence_threshold
+        enter = model_prob >= dynamic_threshold and regime_ok and slope_ok
+    else:
+        enter = rules_enter
 
     return {
         "enter": enter,
@@ -405,6 +493,11 @@ def build_entry_signal(closes: List[float], cfg: Config, use_model: bool = True,
         "model_probability": model_prob,
         "model_used": model_prob is not None,
         "model_skip_reason": model_skip_reason,
+        "dynamic_threshold": dynamic_threshold,
+        "trend_regime": trend["regime"],
+        "trend_slope_15m": trend["ret_15m"],
+        "trend_volatility": trend["volatility"],
+        "drift_zscore": drift_zscore,
     }
 
 
@@ -452,48 +545,6 @@ def emit(event: str, **fields: object) -> None:
 EMIT_PRETTY = False
 
 
-def load_runtime_params(path: str) -> Dict[str, Any]:
-    runtime_path = Path(path)
-    if not runtime_path.exists():
-        return {}
-    try:
-        data = json.loads(runtime_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if isinstance(data, dict) and isinstance(data.get("best_params"), dict):
-        return dict(data["best_params"])
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def apply_runtime_params(cfg: Config, params: Dict[str, Any]) -> None:
-    float_map = {
-        "RSI_MIN": "rsi_min",
-        "RSI_MAX": "rsi_max",
-        "MIN_MOMENTUM_PCT": "min_momentum_pct",
-        "TAKE_PROFIT_BUFFER_USD": "take_profit_buffer_usd",
-    }
-    int_map = {
-        "MOMENTUM_LOOKBACK": "momentum_lookback",
-        "MAX_HOLD_MINUTES": "max_hold_minutes",
-    }
-
-    for key, field in float_map.items():
-        if key in params:
-            try:
-                setattr(cfg, field, float(params[key]))
-            except (TypeError, ValueError):
-                continue
-
-    for key, field in int_map.items():
-        if key in params:
-            try:
-                setattr(cfg, field, int(float(params[key])))
-            except (TypeError, ValueError):
-                continue
-
-
 def _maybe_retrain_model(cfg: Config) -> None:
     """Retrain TF entry model via dedicated ML Python interpreter."""
     try:
@@ -516,9 +567,7 @@ def _maybe_retrain_model(cfg: Config) -> None:
             )
             return
 
-        command = [str(python_cmd), str(SRC_DIR / "model.py"), "--days", str(cfg.model_train_days)]
-        if cfg.sweep_quiet:
-            command.append("--quiet")
+        command = [str(python_cmd), str(SRC_DIR / "model.py"), "--days", str(cfg.model_train_days), "--quiet"]
 
         emit(
             "model_train_start",
@@ -559,45 +608,6 @@ def _maybe_retrain_model(cfg: Config) -> None:
         emit("error", message=f"Model training failed: {err}")
 
 
-def maybe_refresh_runtime_params(cfg: Config, now_ts: float) -> None:
-    if not cfg.auto_sweep:
-        return
-
-    runtime_path = Path(cfg.runtime_params_file)
-    refresh_seconds = max(cfg.sweep_refresh_minutes, 1) * 60
-    if runtime_path.exists():
-        age_seconds = now_ts - runtime_path.stat().st_mtime
-        if age_seconds < refresh_seconds:
-            return
-
-    emit(
-        "decision",
-        action="auto_sweep_start",
-        backtest_days=cfg.backtest_days,
-        runtime_params_file=cfg.runtime_params_file,
-    )
-    try:
-        try:
-            import sweeps
-        except ModuleNotFoundError:
-            from src import sweeps
-
-        best = sweeps.run_sweep(
-            backtest_days=cfg.backtest_days,
-            sweep_quiet=cfg.sweep_quiet,
-            runtime_params_path=Path(cfg.runtime_params_file),
-        )
-        emit(
-            "decision",
-            action="auto_sweep_complete",
-            score=round(float(best["score"]), 2),
-            equity=round(float(best["equity"]), 2),
-            pnl=round(float(best["pnl"]), 2),
-        )
-    except Exception as err:
-        emit("error", message=f"Auto sweep failed: {err}")
-
-
 def maybe_refresh_model(cfg: Config, now_ts: float) -> None:
     if not cfg.auto_model_retrain:
         return
@@ -627,7 +637,6 @@ def run() -> None:
     in_flight_side: Optional[str] = None
     position_opened_at: Optional[float] = None
     cooldown_until: float = 0.0
-    runtime_signature = ""
     last_seen_bar_ts: Optional[datetime] = None
     stale_poll_count = 0
     stale_event_count = 0
@@ -664,9 +673,6 @@ def run() -> None:
         max_bar_age_seconds=cfg.max_bar_age_seconds,
         stale_event_reset_after=cfg.stale_event_reset_after,
         trade_log_file=cfg.trade_log_file,
-        auto_sweep=cfg.auto_sweep,
-        sweep_refresh_minutes=cfg.sweep_refresh_minutes,
-        runtime_params_file=cfg.runtime_params_file,
         auto_model_retrain=cfg.auto_model_retrain,
         model_refresh_minutes=cfg.model_refresh_minutes,
         model_train_python=cfg.model_train_python,
@@ -699,25 +705,7 @@ def run() -> None:
         while True:
             try:
                 now_ts = time.time()
-                maybe_refresh_runtime_params(cfg, now_ts)
                 maybe_refresh_model(cfg, now_ts)
-
-                runtime_params = load_runtime_params(cfg.runtime_params_file)
-                if runtime_params:
-                    apply_runtime_params(cfg, runtime_params)
-                    current_signature = json.dumps(runtime_params, sort_keys=True)
-                    if current_signature != runtime_signature:
-                        runtime_signature = current_signature
-                        emit(
-                            "runtime_params_applied",
-                            rsi_min=cfg.rsi_min,
-                            rsi_max=cfg.rsi_max,
-                            momentum_lookback=cfg.momentum_lookback,
-                            min_momentum_pct=cfg.min_momentum_pct,
-                            take_profit_buffer_usd=cfg.take_profit_buffer_usd,
-                            max_hold_minutes=cfg.max_hold_minutes,
-                            source=cfg.runtime_params_file,
-                        )
 
                 position = api.get_position()
 
@@ -968,11 +956,27 @@ def run() -> None:
                         model_probability=round(signal["model_probability"], 4) if signal.get("model_probability") is not None else None,
                         model_used=signal.get("model_used", False),
                         model_skip_reason=signal.get("model_skip_reason"),
+                        dynamic_threshold=round(float(signal.get("dynamic_threshold", cfg.model_confidence_threshold)), 4),
+                        trend_regime=signal.get("trend_regime"),
+                        trend_slope_15m=round(float(signal.get("trend_slope_15m", 0.0)), 6),
+                        trend_volatility=round(float(signal.get("trend_volatility", 0.0)), 6),
+                        drift_zscore=round(float(signal["drift_zscore"]), 3) if signal.get("drift_zscore") is not None else None,
                         latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
                         bar_age_seconds=bar_age_seconds,
                         stale_poll_count=stale_poll_count,
                         signal_enter=enter_now,
                     )
+
+                    if enter_now and bar_age_seconds > cfg.max_bar_age_seconds:
+                        emit(
+                            "decision",
+                            action="skip_buy_stale_bar",
+                            bar_age_seconds=bar_age_seconds,
+                            max_bar_age_seconds=cfg.max_bar_age_seconds,
+                            latest_bar_utc=latest_bar_ts.isoformat().replace("+00:00", "Z"),
+                        )
+                        time.sleep(cfg.poll_seconds)
+                        continue
 
                     if enter_now:
                         account = api.get_account()

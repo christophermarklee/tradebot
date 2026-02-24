@@ -113,8 +113,12 @@ if [[ "$PREPARE_MODEL" == "true" ]]; then
   echo "[session] running model warmup + training" | tee -a "$BOT_LOG"
   set +e
   MODEL_REQUIRE_GPU="${MODEL_REQUIRE_GPU:-true}" \
-  PYTHON_BIN="$PYTHON_BIN" \
-  bash "$ROOT_DIR/scripts/train_model_gpu_warmup.sh" --days "$MODEL_DAYS" --quiet >> "$BOT_LOG" 2>&1
+  "$PYTHON_BIN" src/model.py --warmup-only >> "$BOT_LOG" 2>&1
+  WARMUP_EXIT_CODE=$?
+  if [[ "$WARMUP_EXIT_CODE" -eq 0 ]]; then
+    MODEL_REQUIRE_GPU="${MODEL_REQUIRE_GPU:-true}" \
+    "$PYTHON_BIN" src/model.py --days "$MODEL_DAYS" --quiet >> "$BOT_LOG" 2>&1
+  fi
   MODEL_PREP_EXIT_CODE=$?
   set -e
 
@@ -166,8 +170,13 @@ RUNNER_CHILD_PID=""
 set -e
 
 echo "$EXIT_CODE" > "$STATUS_FILE"
-
-"$PYTHON_BIN" "$ROOT_DIR/scripts/review_bot_session.py" --log "$BOT_LOG" --exit-code "$EXIT_CODE" > "$SUMMARY_LOG"
+cat > "$SUMMARY_LOG" <<EOF
+{
+  "log": "${BOT_LOG}",
+  "exit_code": ${EXIT_CODE},
+  "timed_out": $([[ "$EXIT_CODE" -eq 124 ]] && echo true || echo false)
+}
+EOF
 
 echo "[session] status_file=$STATUS_FILE"
 echo "[session] summary_log=$SUMMARY_LOG"

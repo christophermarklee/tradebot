@@ -18,10 +18,8 @@ if str(SRC) not in sys.path:
 from bot import (  # noqa: E402
     AlpacaRest,
     Config,
-    apply_runtime_params,
     get_config_value,
     load_config,
-    load_runtime_params,
     should_enter,
 )
 
@@ -116,11 +114,6 @@ def run_backtest() -> None:
         "y",
         "on",
     }
-    runtime_params_file = get_config_value("RUNTIME_PARAMS_FILE", "src/runtime_params.json")
-    runtime_params = load_runtime_params(runtime_params_file)
-    if runtime_params:
-        apply_runtime_params(cfg, runtime_params)
-
     api = AlpacaRest(cfg)
 
     # Fetch actual account cash to use in backtest simulation
@@ -304,18 +297,6 @@ def run_backtest() -> None:
     print(f"=== Backtest: Last {days} Day(s) (1Min bars) ===")
     print(f"Symbol: {cfg.data_symbol}")
     print(f"Backtest days: {days}")
-    print(f"Runtime params file: {runtime_params_file}")
-    if runtime_params:
-        print(
-            "Runtime params applied: "
-            f"RSI_MIN={cfg.rsi_min}, RSI_MAX={cfg.rsi_max}, "
-            f"MOMENTUM_LOOKBACK={cfg.momentum_lookback}, "
-            f"MIN_MOMENTUM_PCT={cfg.min_momentum_pct}, "
-            f"TAKE_PROFIT_BUFFER_USD={cfg.take_profit_buffer_usd}, "
-            f"MAX_HOLD_MINUTES={cfg.max_hold_minutes}"
-        )
-    else:
-        print("Runtime params applied: none (using .env defaults)")
     print(f"Bars: {len(bars)}")
     print(
         "Bar quality: "
